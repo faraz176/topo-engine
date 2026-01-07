@@ -1,0 +1,750 @@
+{
+  "schemaVersion": 1,
+  "meta": {
+    "name": "Google DC Stress Test"
+  },
+  "nodes": [
+    {
+      "id": "R1",
+      "type": "router",
+      "x": 300,
+      "y": 50,
+      "seq": 28
+    },
+    {
+      "id": "R2",
+      "type": "router",
+      "x": 500,
+      "y": 50,
+      "seq": 29
+    },
+    {
+      "id": "R3",
+      "type": "router",
+      "x": 700,
+      "y": 50,
+      "seq": 30
+    },
+    {
+      "id": "R4",
+      "type": "router",
+      "x": 900,
+      "y": 50,
+      "seq": 31
+    },
+    {
+      "id": "R5",
+      "type": "router",
+      "x": 1050,
+      "y": 130,
+      "seq": 32
+    },
+    {
+      "id": "R6",
+      "type": "router",
+      "x": 1130,
+      "y": 130,
+      "seq": 33
+    },
+    {
+      "id": "R7",
+      "type": "router",
+      "x": 1050,
+      "y": 600,
+      "seq": 34
+    },
+    {
+      "id": "R8",
+      "type": "router",
+      "x": 1130,
+      "y": 600,
+      "seq": 35
+    },
+    {
+      "id": "SW1",
+      "type": "switch",
+      "x": 250,
+      "y": 120,
+      "seq": 0
+    },
+    {
+      "id": "SW10",
+      "type": "switch",
+      "x": 775,
+      "y": 260,
+      "seq": 9
+    },
+    {
+      "id": "SW11",
+      "type": "switch",
+      "x": 900,
+      "y": 260,
+      "seq": 10
+    },
+    {
+      "id": "SW12",
+      "type": "switch",
+      "x": 1025,
+      "y": 260,
+      "seq": 11
+    },
+    {
+      "id": "SW13",
+      "type": "switch",
+      "x": 100,
+      "y": 450,
+      "seq": 12
+    },
+    {
+      "id": "SW14",
+      "type": "switch",
+      "x": 170,
+      "y": 450,
+      "seq": 13
+    },
+    {
+      "id": "SW15",
+      "type": "switch",
+      "x": 240,
+      "y": 450,
+      "seq": 14
+    },
+    {
+      "id": "SW16",
+      "type": "switch",
+      "x": 310,
+      "y": 450,
+      "seq": 15
+    },
+    {
+      "id": "SW17",
+      "type": "switch",
+      "x": 380,
+      "y": 450,
+      "seq": 16
+    },
+    {
+      "id": "SW18",
+      "type": "switch",
+      "x": 450,
+      "y": 450,
+      "seq": 17
+    },
+    {
+      "id": "SW19",
+      "type": "switch",
+      "x": 520,
+      "y": 450,
+      "seq": 18
+    },
+    {
+      "id": "SW2",
+      "type": "switch",
+      "x": 450,
+      "y": 120,
+      "seq": 1
+    },
+    {
+      "id": "SW20",
+      "type": "switch",
+      "x": 590,
+      "y": 450,
+      "seq": 19
+    },
+    {
+      "id": "SW21",
+      "type": "switch",
+      "x": 660,
+      "y": 450,
+      "seq": 20
+    },
+    {
+      "id": "SW22",
+      "type": "switch",
+      "x": 730,
+      "y": 450,
+      "seq": 21
+    },
+    {
+      "id": "SW23",
+      "type": "switch",
+      "x": 800,
+      "y": 450,
+      "seq": 22
+    },
+    {
+      "id": "SW24",
+      "type": "switch",
+      "x": 870,
+      "y": 450,
+      "seq": 23
+    },
+    {
+      "id": "SW25",
+      "type": "switch",
+      "x": 940,
+      "y": 450,
+      "seq": 24
+    },
+    {
+      "id": "SW26",
+      "type": "switch",
+      "x": 1010,
+      "y": 450,
+      "seq": 25
+    },
+    {
+      "id": "SW27",
+      "type": "switch",
+      "x": 1080,
+      "y": 450,
+      "seq": 26
+    },
+    {
+      "id": "SW28",
+      "type": "switch",
+      "x": 1150,
+      "y": 450,
+      "seq": 27
+    },
+    {
+      "id": "SW29",
+      "type": "switch",
+      "x": 220,
+      "y": 650,
+      "seq": 36
+    },
+    {
+      "id": "SW3",
+      "type": "switch",
+      "x": 650,
+      "y": 120,
+      "seq": 2
+    },
+    {
+      "id": "SW30",
+      "type": "switch",
+      "x": 420,
+      "y": 650,
+      "seq": 37
+    },
+    {
+      "id": "SW31",
+      "type": "switch",
+      "x": 620,
+      "y": 650,
+      "seq": 38
+    },
+    {
+      "id": "SW32",
+      "type": "switch",
+      "x": 820,
+      "y": 650,
+      "seq": 39
+    },
+    {
+      "id": "SW4",
+      "type": "switch",
+      "x": 850,
+      "y": 120,
+      "seq": 3
+    },
+    {
+      "id": "SW5",
+      "type": "switch",
+      "x": 150,
+      "y": 260,
+      "seq": 4
+    },
+    {
+      "id": "SW6",
+      "type": "switch",
+      "x": 275,
+      "y": 260,
+      "seq": 5
+    },
+    {
+      "id": "SW7",
+      "type": "switch",
+      "x": 400,
+      "y": 260,
+      "seq": 6
+    },
+    {
+      "id": "SW8",
+      "type": "switch",
+      "x": 525,
+      "y": 260,
+      "seq": 7
+    },
+    {
+      "id": "SW9",
+      "type": "switch",
+      "x": 650,
+      "y": 260,
+      "seq": 8
+    }
+  ],
+  "links": [
+    {
+      "a": "R1",
+      "b": "SW1",
+      "type": "uplink"
+    },
+    {
+      "a": "R1",
+      "b": "SW2",
+      "type": "uplink"
+    },
+    {
+      "a": "R2",
+      "b": "SW2",
+      "type": "uplink"
+    },
+    {
+      "a": "R2",
+      "b": "SW3",
+      "type": "uplink"
+    },
+    {
+      "a": "R3",
+      "b": "SW3",
+      "type": "uplink"
+    },
+    {
+      "a": "R3",
+      "b": "SW4",
+      "type": "uplink"
+    },
+    {
+      "a": "R4",
+      "b": "SW1",
+      "type": "uplink"
+    },
+    {
+      "a": "R4",
+      "b": "SW4",
+      "type": "uplink"
+    },
+    {
+      "a": "R5",
+      "b": "R1",
+      "type": "firewall"
+    },
+    {
+      "a": "R5",
+      "b": "R2",
+      "type": "firewall"
+    },
+    {
+      "a": "R5",
+      "b": "SW2",
+      "type": "uplink"
+    },
+    {
+      "a": "R5",
+      "b": "SW3",
+      "type": "uplink"
+    },
+    {
+      "a": "R6",
+      "b": "R3",
+      "type": "firewall"
+    },
+    {
+      "a": "R6",
+      "b": "R4",
+      "type": "firewall"
+    },
+    {
+      "a": "R6",
+      "b": "SW2",
+      "type": "uplink"
+    },
+    {
+      "a": "R6",
+      "b": "SW3",
+      "type": "uplink"
+    },
+    {
+      "a": "R7",
+      "b": "SW11",
+      "type": "ethernet"
+    },
+    {
+      "a": "R7",
+      "b": "SW12",
+      "type": "ethernet"
+    },
+    {
+      "a": "R8",
+      "b": "SW10",
+      "type": "ethernet"
+    },
+    {
+      "a": "R8",
+      "b": "SW9",
+      "type": "ethernet"
+    },
+    {
+      "a": "SW10",
+      "b": "SW1",
+      "type": "ethernet"
+    },
+    {
+      "a": "SW10",
+      "b": "SW2",
+      "type": "ethernet"
+    },
+    {
+      "a": "SW10",
+      "b": "SW3",
+      "type": "ethernet"
+    },
+    {
+      "a": "SW10",
+      "b": "SW4",
+      "type": "ethernet"
+    },
+    {
+      "a": "SW11",
+      "b": "SW1",
+      "type": "ethernet"
+    },
+    {
+      "a": "SW11",
+      "b": "SW2",
+      "type": "ethernet"
+    },
+    {
+      "a": "SW11",
+      "b": "SW3",
+      "type": "ethernet"
+    },
+    {
+      "a": "SW11",
+      "b": "SW4",
+      "type": "ethernet"
+    },
+    {
+      "a": "SW12",
+      "b": "SW1",
+      "type": "ethernet"
+    },
+    {
+      "a": "SW12",
+      "b": "SW2",
+      "type": "ethernet"
+    },
+    {
+      "a": "SW12",
+      "b": "SW3",
+      "type": "ethernet"
+    },
+    {
+      "a": "SW12",
+      "b": "SW4",
+      "type": "ethernet"
+    },
+    {
+      "a": "SW13",
+      "b": "SW5",
+      "type": "ethernet"
+    },
+    {
+      "a": "SW13",
+      "b": "SW6",
+      "type": "ethernet"
+    },
+    {
+      "a": "SW14",
+      "b": "SW5",
+      "type": "ethernet"
+    },
+    {
+      "a": "SW14",
+      "b": "SW6",
+      "type": "ethernet"
+    },
+    {
+      "a": "SW15",
+      "b": "SW6",
+      "type": "ethernet"
+    },
+    {
+      "a": "SW15",
+      "b": "SW7",
+      "type": "ethernet"
+    },
+    {
+      "a": "SW16",
+      "b": "SW6",
+      "type": "ethernet"
+    },
+    {
+      "a": "SW16",
+      "b": "SW7",
+      "type": "ethernet"
+    },
+    {
+      "a": "SW17",
+      "b": "SW7",
+      "type": "ethernet"
+    },
+    {
+      "a": "SW17",
+      "b": "SW8",
+      "type": "ethernet"
+    },
+    {
+      "a": "SW18",
+      "b": "SW7",
+      "type": "ethernet"
+    },
+    {
+      "a": "SW18",
+      "b": "SW8",
+      "type": "ethernet"
+    },
+    {
+      "a": "SW19",
+      "b": "SW8",
+      "type": "ethernet"
+    },
+    {
+      "a": "SW19",
+      "b": "SW9",
+      "type": "ethernet"
+    },
+    {
+      "a": "SW20",
+      "b": "SW8",
+      "type": "ethernet"
+    },
+    {
+      "a": "SW20",
+      "b": "SW9",
+      "type": "ethernet"
+    },
+    {
+      "a": "SW21",
+      "b": "SW10",
+      "type": "ethernet"
+    },
+    {
+      "a": "SW21",
+      "b": "SW9",
+      "type": "ethernet"
+    },
+    {
+      "a": "SW22",
+      "b": "SW10",
+      "type": "ethernet"
+    },
+    {
+      "a": "SW22",
+      "b": "SW9",
+      "type": "ethernet"
+    },
+    {
+      "a": "SW23",
+      "b": "SW10",
+      "type": "ethernet"
+    },
+    {
+      "a": "SW23",
+      "b": "SW11",
+      "type": "ethernet"
+    },
+    {
+      "a": "SW24",
+      "b": "SW10",
+      "type": "ethernet"
+    },
+    {
+      "a": "SW24",
+      "b": "SW11",
+      "type": "ethernet"
+    },
+    {
+      "a": "SW25",
+      "b": "SW11",
+      "type": "ethernet"
+    },
+    {
+      "a": "SW25",
+      "b": "SW12",
+      "type": "ethernet"
+    },
+    {
+      "a": "SW26",
+      "b": "SW11",
+      "type": "ethernet"
+    },
+    {
+      "a": "SW26",
+      "b": "SW12",
+      "type": "ethernet"
+    },
+    {
+      "a": "SW27",
+      "b": "SW12",
+      "type": "ethernet"
+    },
+    {
+      "a": "SW27",
+      "b": "SW5",
+      "type": "ethernet"
+    },
+    {
+      "a": "SW28",
+      "b": "SW12",
+      "type": "ethernet"
+    },
+    {
+      "a": "SW28",
+      "b": "SW5",
+      "type": "ethernet"
+    },
+    {
+      "a": "SW29",
+      "b": "SW5",
+      "type": "storage"
+    },
+    {
+      "a": "SW29",
+      "b": "SW6",
+      "type": "storage"
+    },
+    {
+      "a": "SW30",
+      "b": "SW7",
+      "type": "storage"
+    },
+    {
+      "a": "SW30",
+      "b": "SW8",
+      "type": "storage"
+    },
+    {
+      "a": "SW31",
+      "b": "SW10",
+      "type": "storage"
+    },
+    {
+      "a": "SW31",
+      "b": "SW9",
+      "type": "storage"
+    },
+    {
+      "a": "SW32",
+      "b": "SW11",
+      "type": "storage"
+    },
+    {
+      "a": "SW32",
+      "b": "SW12",
+      "type": "storage"
+    },
+    {
+      "a": "SW5",
+      "b": "SW1",
+      "type": "ethernet"
+    },
+    {
+      "a": "SW5",
+      "b": "SW2",
+      "type": "ethernet"
+    },
+    {
+      "a": "SW5",
+      "b": "SW3",
+      "type": "ethernet"
+    },
+    {
+      "a": "SW5",
+      "b": "SW4",
+      "type": "ethernet"
+    },
+    {
+      "a": "SW6",
+      "b": "SW1",
+      "type": "ethernet"
+    },
+    {
+      "a": "SW6",
+      "b": "SW2",
+      "type": "ethernet"
+    },
+    {
+      "a": "SW6",
+      "b": "SW3",
+      "type": "ethernet"
+    },
+    {
+      "a": "SW6",
+      "b": "SW4",
+      "type": "ethernet"
+    },
+    {
+      "a": "SW7",
+      "b": "SW1",
+      "type": "ethernet"
+    },
+    {
+      "a": "SW7",
+      "b": "SW2",
+      "type": "ethernet"
+    },
+    {
+      "a": "SW7",
+      "b": "SW3",
+      "type": "ethernet"
+    },
+    {
+      "a": "SW7",
+      "b": "SW4",
+      "type": "ethernet"
+    },
+    {
+      "a": "SW8",
+      "b": "SW1",
+      "type": "ethernet"
+    },
+    {
+      "a": "SW8",
+      "b": "SW2",
+      "type": "ethernet"
+    },
+    {
+      "a": "SW8",
+      "b": "SW3",
+      "type": "ethernet"
+    },
+    {
+      "a": "SW8",
+      "b": "SW4",
+      "type": "ethernet"
+    },
+    {
+      "a": "SW9",
+      "b": "SW1",
+      "type": "ethernet"
+    },
+    {
+      "a": "SW9",
+      "b": "SW2",
+      "type": "ethernet"
+    },
+    {
+      "a": "SW9",
+      "b": "SW3",
+      "type": "ethernet"
+    },
+    {
+      "a": "SW9",
+      "b": "SW4",
+      "type": "ethernet"
+    }
+  ]
+}
