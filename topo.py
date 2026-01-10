@@ -1,4 +1,3 @@
-\
 import tkinter as tk
 import json
 from tkinter import filedialog, messagebox
@@ -57,8 +56,8 @@ class TopologyTool:
 
         # Data (canvas ids)
         self.nodes = {}      # node_canvas_id -> {"type": "router|switch", "seq": int}
-        self.edges = []      # [(line_id, n1, n2), ...]
-        self.edge_map = {}   # line_id -> (n1, n2)
+        self.edges = []      # [{"line": line_id, "a": n1, "b": n2, "count": int, "dots": {...}}, ...]
+        self.edge_map = {}   # line_id -> edge dict (same object stored in self.edges)
         self.node_seq = 0
 
         # Stable IDs + labels (for JSON)
@@ -185,7 +184,8 @@ class TopologyTool:
 
         links_out = []
         seen = set()
-        for _, n1, n2 in self.edges:
+        for e in self.edges:
+            n1, n2 = e["a"], e["b"]
             a = self.node_uid.get(n1)
             b = self.node_uid.get(n2)
             if not a or not b:
@@ -194,7 +194,11 @@ class TopologyTool:
             if key in seen:
                 continue
             seen.add(key)
-            links_out.append({"a": a, "b": b, "type": "ethernet"})
+
+            out = {"a": a, "b": b, "type": "ethernet"}
+            if e.get("count", 1) > 1:
+                out["count"] = e["count"]   # persisted multiplicity (still no UI numbers)
+            links_out.append(out)
 
         links_out.sort(key=lambda e: (e["a"], e["b"]))
 
@@ -256,9 +260,14 @@ class TopologyTool:
                 continue
             n1 = self.uid_node.get(str(a))
             n2 = self.uid_node.get(str(b))
-            if not n1 or not n2:
+            if not n1 or not n2 or n1 == n2:
                 continue
-            if n1 != n2 and not self.edge_exists(n1, n2):
+
+            count = int(e.get("count", 1))
+            if count < 1:
+                count = 1
+
+            for _ in range(count):
                 self.connect_nodes(n1, n2)
 
         self.update_edges()
@@ -471,6 +480,25 @@ class TopologyTool:
             tags=("ui",)
         )
 
+    # ───────────────── Selection box logic ─────────────────
+
+    def update_group_selection(self, x1, y1, x2, y2):
+        new_sel = set()
+        minx, maxx = min(x1, x2), max(x1, x2)
+        miny, maxy = min(y1, y2), max(y1, y2)
+
+        for node in self.nodes:
+            cx, cy = self.get_center(node)
+            if minx <= cx <= maxx and miny <= cy <= maxy:
+                new_sel.add(node)
+
+        for node in list(self.selected_nodes - new_sel):
+            self.set_node_highlight(node, False)
+        for node in list(new_sel - self.selected_nodes):
+            self.set_node_highlight(node, True)
+
+        self.selected_nodes = new_sel
+
     # ───────────────── Preview wire ─────────────────
 
     def _ensure_preview(self, x, y):
@@ -578,7 +606,8 @@ class TopologyTool:
 
     def build_adjacency(self):
         adj = {n: [] for n in self.nodes}
-        for _, n1, n2 in self.edges:
+        for e in self.edges:
+            n1, n2 = e["a"], e["b"]
             if n1 in self.nodes and n2 in self.nodes:
                 adj[n1].append(n2)
                 adj[n2].append(n1)
@@ -620,20 +649,29 @@ class TopologyTool:
             return
 
     def _delete_edge(self, line_id):
-        self.canvas.delete(line_id)
-        self.edge_map.pop(line_id, None)
-        self.edges = [(ln, n1, n2) for (ln, n1, n2) in self.edges if ln != line_id]
+        edge = self.edge_map.pop(line_id, None)
+        if edge is None:
+            return
+
+        for dot in edge["dots"].values():
+            self.canvas.delete(dot)
+
+        self.canvas.delete(edge["line"])
+        if edge in self.edges:
+            self.edges.remove(edge)
 
     def _delete_nodes(self, nodes_to_delete: set):
         self.deselect_edge()
 
+        # remove edges touching doomed nodes
         to_remove = []
-        for (ln, n1, n2) in self.edges:
-            if n1 in nodes_to_delete or n2 in nodes_to_delete:
-                to_remove.append(ln)
+        for e in self.edges:
+            if e["a"] in nodes_to_delete or e["b"] in nodes_to_delete:
+                to_remove.append(e["line"])
         for ln in to_remove:
             self._delete_edge(ln)
 
+        # remove nodes + labels + uid mapping
         for n in nodes_to_delete:
             if n in self.nodes:
                 lbl = self.node_labels.pop(n, None)
@@ -865,17 +903,15 @@ class TopologyTool:
             if self.pending_place and self.place_start and self.mode in ("router", "switch"):
                 new_node = self.create_node(self.place_start[0], self.place_start[1])
                 if new_node is not None:
-
-        # --- AUTO-CHAIN FIX ---
+                    # If we have a chain head, always attempt connect.
+                    # Re-connecting the same pair increments interface count.
                     if self.chain_node is not None and self.chain_node in self.nodes:
-                        if self.chain_node != new_node and not self.edge_exists(self.chain_node, new_node):
+                        if self.chain_node != new_node:
                             self.connect_nodes(self.chain_node, new_node)
 
-        # Advance the chain to the new node (continuous chaining)
+                    # Advance the chain to the new node (continuous chaining)
                     self.chain_node = new_node
                     self._ensure_preview(event.x, event.y)
-
-        # --- END FIX ---
 
                     self.nav_curr = new_node
                     self.nav_prev = None
@@ -891,8 +927,7 @@ class TopologyTool:
                 src = self.pre_press_chain
 
                 if src is not None and src in self.nodes and src != clicked:
-                    if not self.edge_exists(src, clicked):
-                        self.connect_nodes(src, clicked)
+                    self.connect_nodes(src, clicked)
 
                     self.nav_prev = src
                     self.nav_curr = clicked
@@ -1005,51 +1040,6 @@ class TopologyTool:
             return self._create_node_of_type("switch", x, y)
         return None
 
-    def connect_nodes(self, n1, n2):
-        x1, y1 = self.get_center(n1)
-        x2, y2 = self.get_center(n2)
-        line = self.canvas.create_line(
-            x1, y1, x2, y2,
-            fill=EDGE_COLOR, width=EDGE_WIDTH,
-            tags=("topo",)
-        )
-        self.edges.append((line, n1, n2))
-        self.edge_map[line] = (n1, n2)
-        self.canvas.tag_lower(line)
-
-    def update_edges(self):
-        for line, n1, n2 in self.edges:
-            if n1 not in self.nodes or n2 not in self.nodes:
-                continue
-            x1, y1 = self.get_center(n1)
-            x2, y2 = self.get_center(n2)
-            self.canvas.coords(line, x1, y1, x2, y2)
-
-    def edge_exists(self, a, b):
-        for _, n1, n2 in self.edges:
-            if (n1 == a and n2 == b) or (n1 == b and n2 == a):
-                return True
-        return False
-
-    # ───────────────── Selection box logic ─────────────────
-
-    def update_group_selection(self, x1, y1, x2, y2):
-        new_sel = set()
-        minx, maxx = min(x1, x2), max(x1, x2)
-        miny, maxy = min(y1, y2), max(y1, y2)
-
-        for node in self.nodes:
-            cx, cy = self.get_center(node)
-            if minx <= cx <= maxx and miny <= cy <= maxy:
-                new_sel.add(node)
-
-        for node in list(self.selected_nodes - new_sel):
-            self.set_node_highlight(node, False)
-        for node in list(new_sel - self.selected_nodes):
-            self.set_node_highlight(node, True)
-
-        self.selected_nodes = new_sel
-
     # ───────────────── Hit testing helpers ─────────────────
 
     def get_center(self, node):
@@ -1057,6 +1047,7 @@ class TopologyTool:
         return (x1 + x2) / 2, (y1 + y2) / 2
 
     def get_node_at(self, x, y):
+        # Find the first node under cursor (ignores dots/labels because we test membership in self.nodes)
         for item in self.canvas.find_overlapping(x, y, x, y):
             if item in self.nodes:
                 return item
@@ -1091,15 +1082,196 @@ class TopologyTool:
 
         best = None
         best_d = float("inf")
-        for line in candidates:
-            x1, y1, x2, y2 = self.canvas.coords(line)
+        for line_id in candidates:
+            x1, y1, x2, y2 = self.canvas.coords(line_id)
             d = self._dist_point_to_segment(x, y, x1, y1, x2, y2)
             if d < best_d:
                 best_d = d
-                best = line
+                best = line_id
 
         return best if best_d <= EDGE_HIT_TOL else None
 
+    def _update_edge_dots(self, edge):
+        # Back-compat for edges created before labels existed
+        edge.setdefault("dots", {})
+        edge.setdefault("labels", {})
+
+        # Only show dot if more than one interface exists
+        if edge["count"] <= 1:
+            for dot in edge["dots"].values():
+                self.canvas.delete(dot)
+            edge["dots"].clear()
+
+            for lbl in edge["labels"].values():
+                self.canvas.delete(lbl)
+            edge["labels"].clear()
+            return
+
+        for node, other in ((edge["a"], edge["b"]), (edge["b"], edge["a"])):
+            if node not in self.nodes or other not in self.nodes:
+                continue
+
+            cx, cy = self.get_center(node)
+            ox, oy = self.get_center(other)
+
+            dx = ox - cx
+            dy = oy - cy
+            mag = (dx * dx + dy * dy) ** 0.5
+            if mag == 0:
+                continue
+
+            ux, uy = dx / mag, dy / mag
+
+            # Use actual on-canvas node radius (works after zoom)
+            x1, y1, x2, y2 = self.canvas.coords(node)
+            node_rad = min(abs(x2 - x1), abs(y2 - y1)) / 2.0
+
+            # Dot scales with zoom because node_rad scales
+            dot_r = max(2.0, node_rad * 0.12)
+            dot_r = min(dot_r, node_rad * 0.25)
+
+            # Keep dot fully inside node so clicks still hit the node
+            dist = max(0.0, node_rad - dot_r - 2.0)
+
+            px = cx + ux * dist
+            py = cy + uy * dist
+
+            # Place count label next to the dot, slightly perpendicular to the edge
+            # so it's readable and doesn't sit on top of the dot.
+            off = max(6.0, dot_r * 2.0)
+            tx = px + (-uy) * off
+            ty = py + (ux) * off
+
+            if node in edge["dots"]:
+                self.canvas.coords(edge["dots"][node], px - dot_r, py - dot_r, px + dot_r, py + dot_r)
+            else:
+                dot = self.canvas.create_oval(
+                    px - dot_r, py - dot_r, px + dot_r, py + dot_r,
+                    fill="#ff5252",
+                    outline="",
+                    tags=("topo",)
+                )
+                edge["dots"][node] = dot
+
+            label_text = str(edge.get("count", 1))
+            if node in edge["labels"]:
+                self.canvas.coords(edge["labels"][node], tx, ty)
+                self.canvas.itemconfigure(edge["labels"][node], text=label_text)
+            else:
+                lbl = self.canvas.create_text(
+                    tx, ty,
+                    text=label_text,
+                    fill="#ff5252",
+                    font=("Arial", 9, "bold"),
+                    tags=("topo",)
+                )
+                edge["labels"][node] = lbl
+
+    # Helper method to find an edge between two nodes
+    def get_edge_between(self, a, b):
+        for e in self.edges:
+            if (e["a"] == a and e["b"] == b) or (e["a"] == b and e["b"] == a):
+                return e
+        return None
+
+    # Check if an edge exists between two nodes
+    def edge_exists(self, a, b):
+        return self.get_edge_between(a, b) is not None
+
+    # Connect two nodes, incrementing interface count if already connected
+    def connect_nodes(self, n1, n2):
+        if n1 == n2:
+            return
+
+        # If relationship already exists, increment interface count
+        existing = self.get_edge_between(n1, n2)
+        if existing is not None:
+            existing["count"] += 1
+            self._update_edge_dots(existing)
+            return
+
+        x1, y1 = self.get_center(n1)
+        x2, y2 = self.get_center(n2)
+        line = self.canvas.create_line(
+            x1, y1, x2, y2,
+            fill=EDGE_COLOR, width=EDGE_WIDTH,
+            tags=("topo",)
+        )
+        self.canvas.tag_lower(line)
+
+        edge = {
+            "line": line,
+            "a": n1,
+            "b": n2,
+            "count": 1,     # interface count
+            "dots": {},     # node_id -> dot_id
+            "labels": {}    # node_id -> text_id
+        }
+        self.edges.append(edge)
+        self.edge_map[line] = edge
+
+    # Update all edges and their dots
+    def update_edges(self):
+        for e in self.edges:
+            n1, n2 = e["a"], e["b"]
+            if n1 not in self.nodes or n2 not in self.nodes:
+                continue
+            x1, y1 = self.get_center(n1)
+            x2, y2 = self.get_center(n2)
+            self.canvas.coords(e["line"], x1, y1, x2, y2)
+            self._update_edge_dots(e)
+
+    # Delete an edge and its associated dots
+    def _delete_edge(self, line_id):
+        edge = self.edge_map.pop(line_id, None)
+        if edge is None:
+            return
+
+        for dot in edge.get("dots", {}).values():
+            self.canvas.delete(dot)
+
+        for lbl in edge.get("labels", {}).values():
+            self.canvas.delete(lbl)
+
+        self.canvas.delete(edge["line"])
+        if edge in self.edges:
+            self.edges.remove(edge)
+
+    # Delete nodes and their associated edges
+    def _delete_nodes(self, nodes_to_delete: set):
+        self.deselect_edge()
+
+        # remove edges touching doomed nodes
+        to_remove = []
+        for e in self.edges:
+            if e["a"] in nodes_to_delete or e["b"] in nodes_to_delete:
+                to_remove.append(e["line"])
+        for ln in to_remove:
+            self._delete_edge(ln)
+
+        # remove nodes + labels + uid mapping
+        for n in nodes_to_delete:
+            if n in self.nodes:
+                lbl = self.node_labels.pop(n, None)
+                if lbl is not None:
+                    self.canvas.delete(lbl)
+
+                uid = self.node_uid.pop(n, None)
+                if uid is not None:
+                    self.uid_node.pop(uid, None)
+
+                self.canvas.delete(n)
+                self.nodes.pop(n, None)
+
+    # Build adjacency list for navigation
+    def build_adjacency(self):
+        adj = {n: [] for n in self.nodes}
+        for e in self.edges:
+            n1, n2 = e["a"], e["b"]
+            if n1 in self.nodes and n2 in self.nodes:
+                adj[n1].append(n2)
+                adj[n2].append(n1)
+        return adj
 
 if __name__ == "__main__":
     root = tk.Tk()
