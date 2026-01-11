@@ -9,9 +9,9 @@ workflows, with a focus on correctness, simplicity, and extensibility.
 Still actively in production. Not ready for release
 
 
-Project fixes:
+Project fixes (to apply)
 
--Apply shortcut sh running-config (should autocomplete) 
+-Apply shortcut sh running-config (should autocomplete) //
 -Adjust MCP to be more intelligent (we added hosts) (have it generate hosts as well because right now it only has access to 
 routers and switches we want it to have access to hosts as well) 
 -The MCP should be able to configure the devices when asked for example, if I say generate a simple OSPF topology and configure it 
