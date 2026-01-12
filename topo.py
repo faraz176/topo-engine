@@ -317,7 +317,24 @@ class TopologyTool:
         if in_if and not saw_admin:
             out.append("no shutdown")
 
-        return out
+        # Ensure basic mode scaffolding exists: enable + conf t + closing end.
+        lower_cmds = [c.strip().lower() for c in out]
+        has_enable = any(c == "enable" for c in lower_cmds)
+        has_conf = any(c in ("conf t", "configure terminal") for c in lower_cmds)
+        has_end = any(c == "end" for c in lower_cmds)
+
+        final: List[str] = []
+        if not has_enable:
+            final.append("enable")
+        if not has_conf:
+            final.append("configure terminal")
+
+        final.extend(out)
+
+        if not has_end:
+            final.append("end")
+
+        return final
 
     # ───────────────── Menu / JSON ─────────────────
 
@@ -2085,9 +2102,9 @@ class TopologyTool:
             return
 
         if a_if is None:
-            a_if = self.sim.allocate_interface_name(a_uid)
+            a_if = self.sim.allocate_or_reuse_interface_name(a_uid)
         if b_if is None:
-            b_if = self.sim.allocate_interface_name(b_uid)
+            b_if = self.sim.allocate_or_reuse_interface_name(b_uid)
 
         try:
             link_id = self.sim.connect(a_uid, str(a_if), b_uid, str(b_if))

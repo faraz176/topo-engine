@@ -207,6 +207,33 @@ class TopologySim:
             return f"Eth{n-1}"
         return f"Gi0/{n-1}"
 
+    def allocate_or_reuse_interface_name(self, uid: str) -> str:
+        """Prefer a disconnected interface before minting a new one."""
+        uid = _norm_uid(uid)
+        dev = self.devices[uid]
+
+        used_if: set[str] = set()
+        for l in self.links.values():
+            if l.a.device == uid:
+                used_if.add(l.a.ifname)
+            if l.b.device == uid:
+                used_if.add(l.b.ifname)
+
+        candidates = [ifn for ifn in dev.interfaces.keys() if ifn not in used_if]
+        if candidates:
+            def _sort_key(name: str):
+                m = re.match(r"^([A-Za-z]+)(\d+)/(\d+)$", name)
+                if m:
+                    return (m.group(1), int(m.group(2)), int(m.group(3)))
+                m = re.match(r"^([A-Za-z]+)(\d+)$", name)
+                if m:
+                    return (m.group(1), int(m.group(2)), -1)
+                return (name, -1, -1)
+
+            return sorted(candidates, key=_sort_key)[0]
+
+        return self.allocate_interface_name(uid)
+
     def _sync_if_counter(self, uid: str):
         """Ensure future auto-allocated interface names don't collide with existing ones."""
         if uid not in self.devices:
