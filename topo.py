@@ -4,6 +4,8 @@ import os
 from tkinter import filedialog, messagebox
 from typing import Optional, Dict, List
 
+from session_log import SessionLogger
+
 try:
     from ai.agent_panel import AgentPanel
 except Exception:
@@ -54,6 +56,7 @@ class TopologyTool:
                 self.right,
                 get_topology_cb=self.export_dict,
                 apply_topology_cb=self._apply_topology_from_agent,
+                log_event_cb=self.log_event,
             )
             self.agent_panel.pack(fill=tk.BOTH, expand=True)
         else:
@@ -88,6 +91,10 @@ class TopologyTool:
         # Simulator + CLI
         self.sim = TopologySim()
 
+        # In-memory session log (saveable for debugging)
+        self.session = SessionLogger()
+        self.session.add("session_start", cwd=os.getcwd())
+
         # PDF-driven authority: scope gate for IOS-like CLI commands.
         # Override via env var TOPO_SIM_PDFS (semicolon-separated list of absolute paths).
         pdf_env = os.environ.get("TOPO_SIM_PDFS", "").strip()
@@ -112,6 +119,9 @@ class TopologyTool:
             pass
 
         self.cli_engine = CLIEngine(self.sim, authority=self.authority)
+        # Ungated engine for scripted provisioning (agent/MCP apply).
+        # This prevents "config looked correct" but commands were blocked by authority.
+        self.cli_engine_provision = CLIEngine(self.sim, authority=None)
         self.pc_cli_engine = PCCLIEngine(self.sim)
         self.cli_windows: Dict[str, "DeviceCLIWindow"] = {}
 
@@ -136,6 +146,20 @@ class TopologyTool:
 
         # Selection (edge)
         self.selected_edge = None
+
+        # Ping mode (both buttons held on a device)
+        self._buttons_down = set()  # {"L","R"}
+        self.ping_mode = False
+        self.ping_src_node: Optional[int] = None
+        self.ping_src_uid: Optional[str] = None
+        self._ping_src_prev_style = None  # (outline, width)
+
+        # Right-click bookkeeping (menus open on release; also enables right-first ping mode)
+        self._right_down_pos = None
+        self._right_down_edge = None
+        self._right_down_node = None
+        self._right_moved_far = False
+        self._suppress_right_menu = False
 
         # Dragging nodes
         self.dragging = False
@@ -173,6 +197,128 @@ class TopologyTool:
         self.bind_events()
         self.update_title()
 
+    def log_event(self, kind: str, **data):
+        try:
+            self.session.add(kind, **data)
+        except Exception:
+            pass
+
+    def _normalize_ios_provision_commands(self, cmds: List[str]) -> List[str]:
+        # Goal: keep IOS realism (interfaces default down) while making agent-provided
+        # deviceConfigs reliably usable by injecting missing "no shutdown".
+        #
+        # Rules:
+        # - Inside each "interface X" stanza, if neither "shutdown" nor "no shutdown"
+        #   is present before leaving the stanza, inject "no shutdown".
+        # - If any subinterface "X.<vlan>" is configured but the parent "X" never is,
+        #   inject a minimal parent stanza (interface X / no shutdown / exit) after
+        #   entering global config.
+
+        def _is_interface_cmd(s: str) -> bool:
+            return s.lower().startswith("interface ")
+
+        def _parse_ifname(s: str) -> Optional[str]:
+            parts = s.split()
+            if len(parts) < 2:
+                return None
+            return parts[1].strip()
+
+        def _parent_of(ifname: str) -> Optional[str]:
+            if "." not in ifname:
+                return None
+            return ifname.split(".", 1)[0]
+
+        # Pass 1: discover subinterface parents and which physical interfaces are configured.
+        subif_parents: set[str] = set()
+        configured_ifaces: set[str] = set()
+        for c in cmds:
+            s = (c or "").strip()
+            if not s or s.startswith("#"):
+                continue
+            if _is_interface_cmd(s):
+                ifname = _parse_ifname(s)
+                if ifname:
+                    configured_ifaces.add(ifname)
+                    parent = _parent_of(ifname)
+                    if parent:
+                        subif_parents.add(parent)
+
+        missing_parents = sorted(p for p in subif_parents if p not in configured_ifaces)
+
+        # Pass 2: inject missing parent stanzas after entering config mode (if possible).
+        normalized: List[str] = []
+        injected_parents = False
+
+        def _inject_parent_blocks():
+            nonlocal injected_parents
+            if injected_parents or not missing_parents:
+                return
+            for p in missing_parents:
+                normalized.extend([f"interface {p}", "no shutdown", "exit"])
+            injected_parents = True
+
+        for c in cmds:
+            s = (c or "").strip()
+            normalized.append(c)
+            low = s.lower()
+            if low in ("configure terminal", "conf t"):
+                _inject_parent_blocks()
+
+        # If we never saw config mode, inject parent blocks early (after enable if present).
+        if missing_parents and not injected_parents:
+            out2: List[str] = []
+            inserted = False
+            for c in normalized:
+                out2.append(c)
+                if not inserted and (c or "").strip().lower() == "enable":
+                    out2.extend(["configure terminal"])
+                    _inject_parent_blocks()
+                    inserted = True
+            if not inserted:
+                out2 = ["configure terminal"]
+                _inject_parent_blocks()
+                out2.extend(normalized)
+            normalized = out2
+
+        # Pass 3: ensure each interface stanza has explicit admin state.
+        out: List[str] = []
+        in_if = False
+        saw_admin = False
+
+        for c in normalized:
+            s = (c or "").strip()
+            low = s.lower()
+
+            if _is_interface_cmd(s):
+                # Leaving previous interface stanza.
+                if in_if and not saw_admin:
+                    out.append("no shutdown")
+                in_if = True
+                saw_admin = False
+                out.append(c)
+                # Default forwarding ports/subinterfaces to UP unless explicitly shut later.
+                out.append("no shutdown")
+                saw_admin = True
+                continue
+
+            if in_if and low in ("exit", "end"):
+                if not saw_admin:
+                    out.append("no shutdown")
+                out.append(c)
+                in_if = False
+                saw_admin = False
+                continue
+
+            if in_if and (low == "shutdown" or low == "no shutdown" or low.startswith("no shutdown ")):
+                saw_admin = True
+
+            out.append(c)
+
+        if in_if and not saw_admin:
+            out.append("no shutdown")
+
+        return out
+
     # ───────────────── Menu / JSON ─────────────────
 
     def build_menu(self):
@@ -190,7 +336,34 @@ class TopologyTool:
         filemenu.add_command(label="Exit", command=self.root.quit)
 
         menubar.add_cascade(label="File", menu=filemenu)
+
+        sessionmenu = tk.Menu(menubar, tearoff=0)
+        sessionmenu.add_command(label="Save Session Log…", command=self.save_session_log)
+        sessionmenu.add_command(label="Clear Session Log", command=self.clear_session_log)
+        menubar.add_cascade(label="Session", menu=sessionmenu)
+
         self.root.config(menu=menubar)
+
+    def save_session_log(self):
+        path = filedialog.asksaveasfilename(
+            title="Save session log",
+            defaultextension=".session.json",
+            filetypes=[("Session Log JSON", "*.session.json"), ("JSON", "*.json"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            self.session.save_json(path)
+            messagebox.showinfo("Session log", f"Saved session log to:\n{path}")
+        except Exception as e:
+            messagebox.showerror("Session log", str(e))
+
+    def clear_session_log(self):
+        try:
+            self.session.clear()
+            self.session.add("session_cleared")
+        except Exception:
+            pass
 
     def new_file(self):
         self.clear_topology()
@@ -294,6 +467,13 @@ class TopologyTool:
             messagebox.showerror("Open failed", str(e))
 
     def load_from_dict(self, data: dict):
+        self.log_event(
+            "load_topology",
+            schemaVersion=data.get("schemaVersion"),
+            nodeCount=len(data.get("nodes") or []),
+            linkCount=len(data.get("links") or []),
+            hasDeviceConfigs=bool(data.get("deviceConfigs")),
+        )
         if not isinstance(data, dict):
             raise ValueError("Invalid JSON: expected an object at top-level")
 
@@ -347,15 +527,92 @@ class TopologyTool:
                 self.connect_nodes(n1, n2, a_if=a_if, b_if=b_if)
 
         cfgs = data.get("deviceConfigs")
+
+        # 1) Legacy dict form: {"R1": {...export_device_config...}}
         if isinstance(cfgs, dict):
             for uid, cfg in cfgs.items():
                 uid = str(uid)
                 if uid in self.sim.devices and isinstance(cfg, dict):
                     self.sim.import_device_config(uid, cfg)
+                    self.log_event("apply_device_config_dict", uid=uid)
+
+        # 2) List form (structured-output friendly):
+        #    - {"id":"R1","config":{...}}  (dict config)
+        #    - {"id":"R1","cli":"ios","commands":[...]} (command list)
+        if isinstance(cfgs, list):
+            # Apply dict-config entries first (if present)
+            as_dict = {}
+            cli_jobs = []
+            for item in cfgs:
+                if not isinstance(item, dict):
+                    continue
+                uid = item.get("id")
+                if not isinstance(uid, str):
+                    continue
+                if "config" in item and isinstance(item.get("config"), dict):
+                    as_dict[uid] = item.get("config")
+                elif "commands" in item and isinstance(item.get("commands"), list):
+                    cli_jobs.append(item)
+
+            for uid, cfg in as_dict.items():
+                if uid in self.sim.devices and isinstance(cfg, dict):
+                    self.sim.import_device_config(uid, cfg)
+                    self.log_event("apply_device_config_dict", uid=uid)
+
+            # Then execute command lists via the appropriate CLI engine
+            for job in cli_jobs:
+                uid = str(job.get("id"))
+                if uid not in self.sim.devices:
+                    continue
+                cli_kind = (job.get("cli") or "").lower().strip()
+                cmds = [c for c in job.get("commands", []) if isinstance(c, str)]
+                if not cmds:
+                    continue
+
+                self.log_event("apply_device_commands_start", uid=uid, cli=cli_kind, commandCount=len(cmds))
+
+                executed = 0
+                had_error = False
+
+                try:
+                    dev = self.sim.devices.get(uid)
+                    if dev is None:
+                        continue
+
+                    if cli_kind == "pc" or dev.kind == "host":
+                        ctx = self.pc_cli_engine.new_context(uid)
+                        for c in cmds:
+                            s = c.strip()
+                            if not s or s.startswith("#"):
+                                continue
+                            executed += 1
+                            res = self.pc_cli_engine.execute(ctx, s)
+                            if getattr(res, "output", ""):
+                                self.log_event("apply_device_command_output", uid=uid, cli="pc", command=s, output=res.output)
+                    else:
+                        # Provisioning must not be blocked by authority gating.
+                        ctx = self.cli_engine_provision.new_context(uid)
+                        cmds_norm = self._normalize_ios_provision_commands(cmds)
+                        for c in cmds_norm:
+                            s = c.strip()
+                            if not s or s.startswith("#"):
+                                continue
+                            executed += 1
+                            res = self.cli_engine_provision.execute(ctx, s)
+                            if getattr(res, "output", ""):
+                                self.log_event("apply_device_command_output", uid=uid, cli="ios", command=s, output=res.output)
+                except Exception as e:
+                    # Don't fail load because a config line was rejected.
+                    had_error = True
+                    self.log_event("apply_device_commands_error", uid=uid, error=str(e))
+                    pass
+
+                self.log_event("apply_device_commands_done", uid=uid, executed=executed, ok=(not had_error))
 
         self.update_edges()
         self.mode = "neutral"
         self.update_title()
+        self.log_event("load_topology_done", nodeCount=len(self.nodes), edgeCount=len(self.edges))
 
     def _apply_topology_from_agent(self, topo_dict: dict):
         # Wrap so the agent panel can call it safely
@@ -486,6 +743,8 @@ class TopologyTool:
         base = f"Mode: {self.mode.upper()}"
         if self.current_file:
             base += f" — {self.current_file}"
+        if getattr(self, "ping_mode", False) and self.ping_src_uid:
+            base += f" — PING MODE: source={self.ping_src_uid} (click target)"
         self.root.title(base)
 
     # ───────────────── ESC => Neutral ─────────────────
@@ -496,6 +755,7 @@ class TopologyTool:
         self.update_title()
 
     def cancel_transients(self, keep_selection: bool):
+        self._cancel_ping_mode()
         self.chain_node = None
         self._remove_preview()
 
@@ -530,6 +790,112 @@ class TopologyTool:
 
         if not keep_selection:
             self.clear_selection()
+
+    # ───────────────── Ping mode ─────────────────
+
+    def _cancel_ping_mode(self):
+        if not getattr(self, "ping_mode", False):
+            return
+        try:
+            if self.ping_src_node is not None and self._ping_src_prev_style is not None:
+                outline, width = self._ping_src_prev_style
+                # Restore prior visual style.
+                self.canvas.itemconfigure(self.ping_src_node, outline=outline, width=width)
+        except Exception:
+            pass
+        self.ping_mode = False
+        self.ping_src_node = None
+        self.ping_src_uid = None
+        self._ping_src_prev_style = None
+        self.update_title()
+        self.log_event("ping_mode_cancel")
+
+    def _start_ping_mode(self, node_id: int):
+        if node_id not in self.nodes:
+            return
+        uid = self.node_uid.get(node_id)
+        if not uid:
+            return
+
+        # If we're already in ping mode, restart with new source.
+        self._cancel_ping_mode()
+        self.ping_mode = True
+        self.ping_src_node = node_id
+        self.ping_src_uid = uid
+
+        try:
+            prev_outline = self.canvas.itemcget(node_id, "outline")
+            prev_width = self.canvas.itemcget(node_id, "width")
+            self._ping_src_prev_style = (prev_outline, prev_width)
+            # Distinct highlight for ping source.
+            self.canvas.itemconfigure(node_id, outline="#ab47bc", width=3)
+        except Exception:
+            self._ping_src_prev_style = None
+
+        # Ping-mode should not also pan/drag/chain.
+        self.deselect_edge()
+        self._remove_preview()
+        self.chain_node = None
+        self.pending_place = False
+        self.place_start = None
+        self.selection_box = None
+        self.selection_start = None
+
+        self.update_title()
+        self.log_event("ping_mode_start", src=self.ping_src_uid)
+
+    def _pick_device_ip(self, uid: str) -> Optional[str]:
+        dev = self.sim.devices.get(uid)
+        if dev is None:
+            return None
+        # Hosts default to Eth0.
+        if dev.kind == "host":
+            itf = dev.interfaces.get("Eth0")
+            if itf and itf.admin_up and itf.ip:
+                return str(itf.ip)
+            return None
+
+        # Routers/switches: pick first up interface with an IP.
+        for ifn in sorted(dev.interfaces.keys()):
+            itf = dev.interfaces.get(ifn)
+            if itf and itf.admin_up and itf.ip:
+                return str(itf.ip)
+        return None
+
+    def _run_ping_mode(self, dst_node_id: int):
+        if not self.ping_mode or not self.ping_src_uid:
+            return
+        if dst_node_id not in self.nodes:
+            return
+
+        dst_uid = self.node_uid.get(dst_node_id)
+        if not dst_uid or dst_uid == self.ping_src_uid:
+            self._cancel_ping_mode()
+            return
+
+        dst_ip = self._pick_device_ip(dst_uid)
+        if not dst_ip:
+            messagebox.showwarning(
+                "Ping mode",
+                f"Target {dst_uid} has no configured IP address to ping.\n\n"
+                f"Tip: configure an interface IP first (or for PCs: 'ip <ip> <mask> [gateway]').",
+            )
+            self._cancel_ping_mode()
+            return
+
+        lines = self.sim.ping(self.ping_src_uid, dst_ip)
+        self.log_event(
+            "ping_mode_result",
+            src=self.ping_src_uid,
+            dst=dst_uid,
+            dst_ip=dst_ip,
+            output="\n".join(lines),
+        )
+        messagebox.showinfo(
+            "Ping mode",
+            f"{self.ping_src_uid} -> {dst_uid} ({dst_ip})\n\n" + "\n".join(lines),
+        )
+        self._cancel_ping_mode()
 
     def set_mode(self, mode):
         self.mode = mode
@@ -787,6 +1153,14 @@ class TopologyTool:
 
         s = sims.pop(index)
 
+        self.log_event(
+            "remove_parallel_connection",
+            a=self.node_uid.get(edge.get("a")),
+            b=self.node_uid.get(edge.get("b")),
+            removed={"a_if": s.get("a_if"), "b_if": s.get("b_if"), "id": s.get("id")},
+            remaining=len(sims),
+        )
+
         # Remove sim link
         try:
             self.sim.remove_link(s.get("id"))
@@ -864,6 +1238,17 @@ class TopologyTool:
     def _delete_nodes(self, nodes_to_delete: set):
         self.deselect_edge()
 
+        try:
+            doomed = []
+            for n in nodes_to_delete:
+                uid = self.node_uid.get(n)
+                if uid:
+                    doomed.append(uid)
+            if doomed:
+                self.log_event("delete_nodes", count=len(doomed), nodes=sorted(doomed))
+        except Exception:
+            pass
+
         # remove edges touching doomed nodes
         to_remove = []
         for e in self.edges:
@@ -889,6 +1274,11 @@ class TopologyTool:
     # ───────────────── Clear topology ─────────────────
 
     def clear_topology(self):
+        self.log_event(
+            "clear_topology",
+            nodeCount=len(self.nodes),
+            edgeCount=len(self.edges),
+        )
         self.canvas.delete("all")
         self.nodes.clear()
         self.edges.clear()
@@ -910,6 +1300,7 @@ class TopologyTool:
         self.node_labels.clear()
         self.router_count = 0
         self.switch_count = 0
+        self.host_count = 0
 
         self.mode = "neutral"
         self.chain_node = None
@@ -932,26 +1323,27 @@ class TopologyTool:
 
     def on_pan_down(self, event):
         self.canvas.focus_set()
+        self.log_event("mouse_right_down", x=event.x, y=event.y)
 
-        # Right-click on an edge opens edge context menu
-        edge_line = self.get_edge_at(event.x, event.y)
-        if edge_line is not None:
-            self._ctx_edge = edge_line
-            self._rebuild_edge_menu(edge_line)
-            try:
-                self.edge_menu.tk_popup(event.x_root, event.y_root)
-            finally:
-                self.edge_menu.grab_release()
+        # Track right button state (for ping mode).
+        self._buttons_down.add("R")
+        self._right_down_pos = (event.x, event.y)
+        self._right_moved_far = False
+        self._suppress_right_menu = False
+
+        # If left is already held and we're on a node, enter ping mode.
+        node_now = self.get_node_at(event.x, event.y)
+        if node_now is not None and "L" in self._buttons_down:
+            self._suppress_right_menu = True
+            self._start_ping_mode(node_now)
             return
 
-        # Right-click on a device opens context menu
-        node = self.get_node_at(event.x, event.y)
-        if node is not None:
-            self._ctx_node = node
-            try:
-                self.node_menu.tk_popup(event.x_root, event.y_root)
-            finally:
-                self.node_menu.grab_release()
+        # Defer edge/node menus until button release so right-first ping mode works.
+        self._right_down_edge = self.get_edge_at(event.x, event.y)
+        self._right_down_node = node_now
+
+        # If right press began on edge/node, we do NOT start panning.
+        if self._right_down_edge is not None or self._right_down_node is not None:
             return
 
         if self.mode != "neutral":
@@ -969,6 +1361,11 @@ class TopologyTool:
         self.pan_last = (event.x, event.y)
 
     def on_pan_drag(self, event):
+        # If user moves while right button is down, treat as drag (suppress menus).
+        if self._right_down_pos is not None and not self._right_moved_far:
+            if abs(event.x - self._right_down_pos[0]) > DRAG_THRESHOLD or abs(event.y - self._right_down_pos[1]) > DRAG_THRESHOLD:
+                self._right_moved_far = True
+
         if not self.panning or self.pan_last is None:
             return
 
@@ -980,11 +1377,41 @@ class TopologyTool:
         self.last_cursor = (event.x, event.y)
 
     def on_pan_up(self, event):
-        if not self.panning:
-            return
-        self.panning = False
-        self.pan_last = None
-        self.last_cursor = (event.x, event.y)
+        # Clear right button state.
+        self._buttons_down.discard("R")
+
+        # End panning if we were panning.
+        if self.panning:
+            self.panning = False
+            self.pan_last = None
+            self.last_cursor = (event.x, event.y)
+
+        # Show deferred context menu if this was a click (not a drag) and not part of ping mode.
+        if (
+            not self._suppress_right_menu
+            and not self._right_moved_far
+            and not getattr(self, "ping_mode", False)
+        ):
+            if self._right_down_edge is not None:
+                self._ctx_edge = self._right_down_edge
+                self._rebuild_edge_menu(self._right_down_edge)
+                try:
+                    self.edge_menu.tk_popup(event.x_root, event.y_root)
+                finally:
+                    self.edge_menu.grab_release()
+            elif self._right_down_node is not None:
+                self._ctx_node = self._right_down_node
+                try:
+                    self.node_menu.tk_popup(event.x_root, event.y_root)
+                finally:
+                    self.node_menu.grab_release()
+
+        self._right_down_pos = None
+        self._right_down_edge = None
+        self._right_down_node = None
+        self._right_moved_far = False
+        self._suppress_right_menu = False
+        self.log_event("mouse_right_up", x=event.x, y=event.y)
 
     # ───────────────── Zoom ─────────────────
 
@@ -1019,6 +1446,17 @@ class TopologyTool:
 
     def on_mouse_down(self, event):
         self.canvas.focus_set()
+        self.log_event("mouse_left_down", x=event.x, y=event.y)
+
+        # Track left button state (for ping mode).
+        self._buttons_down.add("L")
+
+        # If we're already in ping mode, the next device click is the destination.
+        if getattr(self, "ping_mode", False):
+            node = self.get_node_at(event.x, event.y)
+            if node is not None:
+                self._run_ping_mode(node)
+                return
 
         self.last_cursor = (event.x, event.y)
         self.mouse_down_pos = (event.x, event.y)
@@ -1032,6 +1470,10 @@ class TopologyTool:
         self.chain_set_on_press = False
 
         node = self.get_node_at(event.x, event.y)
+        # If right is currently held and user presses left on a node, enter ping mode.
+        if node is not None and "R" in self._buttons_down:
+            self._start_ping_mode(node)
+            return
         if node:
             self.down_kind = "node"
             self.down_node = node
@@ -1053,6 +1495,24 @@ class TopologyTool:
             self.dragging = True
             self.dragging_group = (len(self.selected_nodes) > 1)
             self.dragging_node = None if self.dragging_group else node
+
+            try:
+                moved_nodes = list(self.selected_nodes) if self.dragging_group else [node]
+                moved = []
+                for n in moved_nodes:
+                    uid = self.node_uid.get(n)
+                    if not uid:
+                        continue
+                    cx, cy = self.get_center(n)
+                    moved.append({"id": uid, "x": cx, "y": cy})
+                self.log_event(
+                    "move_nodes_start",
+                    count=len(moved),
+                    group=bool(self.dragging_group),
+                    nodes=moved,
+                )
+            except Exception:
+                pass
             return
 
         edge = self.get_edge_at(event.x, event.y)
@@ -1128,6 +1588,10 @@ class TopologyTool:
 
     def on_mouse_up(self, event):
         self.last_cursor = (event.x, event.y)
+        self.log_event("mouse_left_up", x=event.x, y=event.y)
+
+        # Clear left button state.
+        self._buttons_down.discard("L")
 
         if self.down_kind == "place_or_select":
 
@@ -1153,6 +1617,26 @@ class TopologyTool:
 
 
         if self.down_kind == "node":
+            # Log drag end once the node(s) are dropped.
+            if self.moved_far and self.down_node is not None:
+                try:
+                    moved_nodes = list(self.selected_nodes) if self.dragging_group else [self.down_node]
+                    moved = []
+                    for n in moved_nodes:
+                        uid = self.node_uid.get(n)
+                        if not uid:
+                            continue
+                        cx, cy = self.get_center(n)
+                        moved.append({"id": uid, "x": cx, "y": cy})
+                    self.log_event(
+                        "move_nodes_done",
+                        count=len(moved),
+                        group=bool(self.dragging_group),
+                        nodes=moved,
+                    )
+                except Exception:
+                    pass
+
             if not self.moved_far and self.down_node is not None:
                 clicked = self.down_node
                 src = self.pre_press_chain
@@ -1258,6 +1742,12 @@ class TopologyTool:
             self.node_seq += 1
             self._attach_uid_and_label(node, "router", forced_uid)
             self._sim_on_node_created(node)
+            try:
+                uid = self.node_uid.get(node)
+                if uid:
+                    self.log_event("create_node", id=uid, type="router", x=float(x), y=float(y))
+            except Exception:
+                pass
             return node
 
         if node_type == "switch":
@@ -1271,6 +1761,12 @@ class TopologyTool:
             self.node_seq += 1
             self._attach_uid_and_label(node, "switch", forced_uid)
             self._sim_on_node_created(node)
+            try:
+                uid = self.node_uid.get(node)
+                if uid:
+                    self.log_event("create_node", id=uid, type="switch", x=float(x), y=float(y))
+            except Exception:
+                pass
             return node
 
         node = self.canvas.create_rectangle(
@@ -1283,6 +1779,12 @@ class TopologyTool:
         self.node_seq += 1
         self._attach_uid_and_label(node, "host", forced_uid)
         self._sim_on_node_created(node)
+        try:
+            uid = self.node_uid.get(node)
+            if uid:
+                self.log_event("create_node", id=uid, type="host", x=float(x), y=float(y))
+        except Exception:
+            pass
         return node
 
     def _sim_on_node_created(self, node_canvas_id: int):
@@ -1535,6 +2037,14 @@ class TopologyTool:
                 # n1/n2 are reversed relative to existing["a"/"b"]. Swap ifnames too.
                 self._sim_on_link_added(existing, existing["a"], existing["b"], a_if=b_if, b_if=a_if)
             self._update_edge_dots(existing)
+            self.log_event(
+                "connect_nodes_parallel",
+                a=self.node_uid.get(existing.get("a")),
+                b=self.node_uid.get(existing.get("b")),
+                count=existing.get("count"),
+                a_if=a_if,
+                b_if=b_if,
+            )
             return
 
         x1, y1 = self.get_center(n1)
@@ -1560,6 +2070,13 @@ class TopologyTool:
         self.edge_map[line] = edge
         self._sim_on_link_added(edge, n1, n2, a_if=a_if, b_if=b_if)
         self._update_edge_dots(edge)
+        self.log_event(
+            "connect_nodes",
+            a=self.node_uid.get(n1),
+            b=self.node_uid.get(n2),
+            a_if=a_if,
+            b_if=b_if,
+        )
 
     def _sim_on_link_added(self, edge: dict, n1: int, n2: int, a_if: Optional[str] = None, b_if: Optional[str] = None):
         a_uid = self.node_uid.get(n1)
@@ -1595,6 +2112,13 @@ class TopologyTool:
         edge = self.edge_map.pop(line_id, None)
         if edge is None:
             return
+
+        self.log_event(
+            "delete_edge",
+            a=self.node_uid.get(edge.get("a")),
+            b=self.node_uid.get(edge.get("b")),
+            count=edge.get("count", 1),
+        )
 
         for s in edge.get("sim_links", []) or []:
             try:

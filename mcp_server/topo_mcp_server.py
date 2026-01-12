@@ -28,15 +28,15 @@ mcp = FastMCP(
     json_response=True,
 )
 
-SCHEMA_VERSION = 1
+SUPPORTED_SCHEMA_VERSIONS = {1, 2}
 
 
 def _validate_topology(data: Dict[str, Any]) -> List[str]:
     problems: List[str] = []
     if not isinstance(data, dict):
         return ["Top-level must be an object."]
-    if data.get("schemaVersion") != SCHEMA_VERSION:
-        problems.append("schemaVersion must be 1.")
+    if data.get("schemaVersion") not in SUPPORTED_SCHEMA_VERSIONS:
+        problems.append("schemaVersion must be 1 or 2.")
     nodes = data.get("nodes")
     links = data.get("links")
     if not isinstance(nodes, list):
@@ -57,8 +57,8 @@ def _validate_topology(data: Dict[str, Any]) -> List[str]:
         if nid in ids:
             problems.append(f"Duplicate node id: {nid}")
         ids.add(nid)
-        if n.get("type") not in ("router", "switch"):
-            problems.append(f"nodes[{i}].type must be 'router' or 'switch'.")
+        if n.get("type") not in ("router", "switch", "host"):
+            problems.append(f"nodes[{i}].type must be 'router', 'switch', or 'host'.")
         for k in ("x", "y"):
             if n.get(k) is None:
                 problems.append(f"nodes[{i}].{k} missing.")
@@ -80,6 +80,25 @@ def _validate_topology(data: Dict[str, Any]) -> List[str]:
         if key in seen:
             problems.append(f"Duplicate link between {key[0]} and {key[1]}.")
         seen.add(key)
+
+        # Optional link interface mappings
+        ifaces = e.get("ifaces")
+        if ifaces is not None and not isinstance(ifaces, list):
+            problems.append(f"links[{i}].ifaces must be a list when present.")
+
+    # Optional device configs
+    cfgs = data.get("deviceConfigs")
+    if cfgs is not None and not isinstance(cfgs, (dict, list)):
+        problems.append("deviceConfigs must be an object or a list when present.")
+    if isinstance(cfgs, list):
+        for j, item in enumerate(cfgs):
+            if not isinstance(item, dict):
+                problems.append(f"deviceConfigs[{j}] must be an object.")
+                continue
+            if not isinstance(item.get("id"), str):
+                problems.append(f"deviceConfigs[{j}].id must be a string.")
+            if "commands" in item and not isinstance(item.get("commands"), list):
+                problems.append(f"deviceConfigs[{j}].commands must be a list when present.")
     return problems
 
 
@@ -196,10 +215,98 @@ def generate_google_dc_stress_test() -> Dict[str, Any]:
     uniq.sort(key=lambda e: (e["a"], e["b"]))
 
     topo = {
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "meta": {"name": "Google DC Stress Test (MCP)"},
         "nodes": sorted(nodes, key=lambda n: (n["type"], n["id"])),
         "links": uniq,
+    }
+    return topo
+
+
+@mcp.tool()
+def generate_simple_ospf_lab_configured() -> Dict[str, Any]:
+    """Generate a small OSPF lab WITH configurations applied.
+
+    Topology: PC1 -- R1 -- R2 -- PC2
+    Includes explicit link.ifaces + deviceConfigs so the UI can load and immediately ping end-to-end.
+    """
+
+    topo = {
+        "schemaVersion": 2,
+        "meta": {"name": "Simple OSPF Lab (Configured)"},
+        "nodes": [
+            {"id": "PC1", "type": "host", "x": 150, "y": 400, "seq": 0},
+            {"id": "R1", "type": "router", "x": 400, "y": 400, "seq": 1},
+            {"id": "R2", "type": "router", "x": 700, "y": 400, "seq": 2},
+            {"id": "PC2", "type": "host", "x": 950, "y": 400, "seq": 3},
+        ],
+        "links": [
+            {
+                "a": "PC1",
+                "b": "R1",
+                "type": "ethernet",
+                "count": 1,
+                "ifaces": [{"a_if": "Eth0", "b_if": "Gi0/0"}],
+            },
+            {
+                "a": "R1",
+                "b": "R2",
+                "type": "ethernet",
+                "count": 1,
+                "ifaces": [{"a_if": "Gi0/1", "b_if": "Gi0/0"}],
+            },
+            {
+                "a": "R2",
+                "b": "PC2",
+                "type": "ethernet",
+                "count": 1,
+                "ifaces": [{"a_if": "Gi0/1", "b_if": "Eth0"}],
+            },
+        ],
+        "deviceConfigs": [
+            {"id": "PC1", "cli": "pc", "commands": ["ip 10.0.1.10 255.255.255.0 10.0.1.1"]},
+            {
+                "id": "R1",
+                "cli": "ios",
+                "commands": [
+                    "enable",
+                    "configure terminal",
+                    "interface Gi0/0",
+                    "ip address 10.0.1.1 255.255.255.0",
+                    "no shutdown",
+                    "exit",
+                    "interface Gi0/1",
+                    "ip address 10.0.12.1 255.255.255.0",
+                    "no shutdown",
+                    "exit",
+                    "router ospf 1",
+                    "network 10.0.1.0 0.0.0.255 area 0",
+                    "network 10.0.12.0 0.0.0.255 area 0",
+                    "end",
+                ],
+            },
+            {
+                "id": "R2",
+                "cli": "ios",
+                "commands": [
+                    "enable",
+                    "configure terminal",
+                    "interface Gi0/0",
+                    "ip address 10.0.12.2 255.255.255.0",
+                    "no shutdown",
+                    "exit",
+                    "interface Gi0/1",
+                    "ip address 10.0.2.1 255.255.255.0",
+                    "no shutdown",
+                    "exit",
+                    "router ospf 1",
+                    "network 10.0.12.0 0.0.0.255 area 0",
+                    "network 10.0.2.0 0.0.0.255 area 0",
+                    "end",
+                ],
+            },
+            {"id": "PC2", "cli": "pc", "commands": ["ip 10.0.2.10 255.255.255.0 10.0.2.1"]},
+        ],
     }
     return topo
 

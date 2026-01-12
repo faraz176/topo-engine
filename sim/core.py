@@ -150,7 +150,8 @@ class TopologySim:
 
         # Cached recompute outputs
         self._routes: Dict[str, List[Route]] = {}
-        self._ospf_neighbors: Dict[str, List[Tuple[str, str, str]]] = {}  # uid -> (neighbor_uid, local_if, state)
+        # uid -> list of (neighbor_router_id, local_if, state)
+        self._ospf_neighbors: Dict[str, List[Tuple[str, str, str]]] = {}
 
     # ───────────────────────────── Devices / Links ─────────────────────────────
 
@@ -287,17 +288,93 @@ class TopologySim:
         self.recompute()
 
     def link_for_end(self, uid: str, ifname: str) -> Optional[str]:
+        uid = _norm_uid(uid)
+        ifname = (ifname or "").strip()
         for lid, l in self.links.items():
             if (l.a.device == uid and l.a.ifname == ifname) or (l.b.device == uid and l.b.ifname == ifname):
                 return lid
+
+        # Router-on-a-stick: subinterfaces share the parent physical link.
+        parent, _vlan = self._split_subinterface(ifname)
+        if parent and parent != ifname:
+            for lid, l in self.links.items():
+                if (l.a.device == uid and l.a.ifname == parent) or (l.b.device == uid and l.b.ifname == parent):
+                    return lid
         return None
 
+    def _split_subinterface(self, ifname: str) -> Tuple[str, Optional[int]]:
+        """Return (parent_ifname, vlan) for subinterfaces like Gi0/0.10."""
+
+        s = (ifname or "").strip()
+        m = re.match(r"^([^\.]+)\.(\d+)$", s)
+        if not m:
+            return s, None
+        return m.group(1), int(m.group(2))
+
+    def _physical_ifname(self, uid: str, ifname: str) -> str:
+        parent, _vlan = self._split_subinterface(ifname)
+        dev = self.devices.get(uid)
+        if dev is None:
+            return ifname
+        if parent and parent in dev.interfaces:
+            return parent
+        return ifname
+
+    def _is_interface_up(self, uid: str, ifname: str) -> bool:
+        dev = self.devices.get(uid)
+        if dev is None:
+            return False
+        itf = dev.interfaces.get(ifname)
+        if itf is None or not itf.admin_up:
+            return False
+
+        parent, _vlan = self._split_subinterface(ifname)
+        if parent and parent != ifname:
+            pitf = dev.interfaces.get(parent)
+            if pitf is not None and not pitf.admin_up:
+                return False
+        return True
+
+    def _segment_id_for_routed_link(self, uid: str, ifname: str) -> int:
+        """Return a deterministic per-link segment id for routed adjacencies.
+
+        Using a single global 'vlan 0' for all routed-to-routed links incorrectly
+        merges unrelated point-to-point links into one broadcast domain, which in
+        turn breaks OSPF adjacency and next-hop selection.
+
+        The returned id is negative to avoid colliding with user VLAN numbers.
+        """
+
+        lid = self.link_for_end(uid, ifname)
+        if not lid:
+            return 0
+        m = re.match(r"^L(\d+)$", str(lid))
+        if m:
+            return -int(m.group(1))
+        # Fallback: stable hash
+        h = 0
+        for ch in str(lid).encode("utf-8"):
+            h = (h * 131 + ch) & 0xFFFFFFFF
+        return -int(h % 2_000_000_000)
+
     def other_end(self, uid: str, ifname: str) -> Optional[LinkEnd]:
+        uid = _norm_uid(uid)
+        ifname = (ifname or "").strip()
+
         for l in self.links.values():
             if l.a.device == uid and l.a.ifname == ifname:
                 return l.b
             if l.b.device == uid and l.b.ifname == ifname:
                 return l.a
+
+        # Router-on-a-stick: subinterfaces share the parent physical link.
+        parent, _vlan = self._split_subinterface(ifname)
+        if parent and parent != ifname:
+            for l in self.links.values():
+                if l.a.device == uid and l.a.ifname == parent:
+                    return l.b
+                if l.b.device == uid and l.b.ifname == parent:
+                    return l.a
         return None
 
     # ───────────────────────────── Serialization ─────────────────────────────
@@ -439,14 +516,48 @@ class TopologySim:
         self._compute_ospf_neighbors()
         self._compute_routes()
 
+    def _effective_router_id(self, uid: str) -> Optional[str]:
+        dev = self.devices.get(uid)
+        if dev is None:
+            return None
+
+        if dev.ospf.router_id:
+            return dev.ospf.router_id
+
+        # Deterministic fallback: highest loopback IP (up), else highest active interface IP.
+        loopbacks: List[ipaddress.IPv4Address] = []
+        actives: List[ipaddress.IPv4Address] = []
+        for ifn, itf in dev.interfaces.items():
+            if not self._is_interface_up(uid, ifn) or not itf.has_ip():
+                continue
+            try:
+                ip_addr = ipaddress.IPv4Address(itf.ip)
+            except Exception:
+                continue
+            if ifn.lower().startswith("lo"):
+                loopbacks.append(ip_addr)
+            else:
+                actives.append(ip_addr)
+
+        if loopbacks:
+            return str(max(loopbacks))
+        if actives:
+            return str(max(actives))
+        return None
+
     def _compute_ospf_neighbors(self):
         self._ospf_neighbors = {uid: [] for uid in self.devices}
 
         routers = [d for d in self.devices.values() if d.kind == "router" and d.ospf.enabled]
+        rid_map: Dict[str, Optional[str]] = {r.uid: self._effective_router_id(r.uid) for r in routers}
+
         # Determine adjacency on shared L2 segment (including direct router-router link).
         for r in routers:
+            r_rid = rid_map.get(r.uid)
+            if not r_rid:
+                continue
             for ifn, itf in r.interfaces.items():
-                if not itf.admin_up or not itf.has_ip():
+                if not self._is_interface_up(r.uid, ifn) or not itf.has_ip():
                     continue
                 if not self._if_ospf_enabled(r.uid, itf):
                     continue
@@ -457,18 +568,21 @@ class TopologySim:
                 for p_uid, p_if in peers:
                     if p_uid == r.uid:
                         continue
-                    self._ospf_neighbors[r.uid].append((p_uid, ifn, "FULL"))
+                    p_rid = rid_map.get(p_uid)
+                    if not p_rid or p_rid == r_rid:
+                        continue
+                    self._ospf_neighbors[r.uid].append((p_rid, ifn, "FULL"))
 
-        # De-dup
+        # De-dup by (neighbor_rid, local_if)
         for uid in self._ospf_neighbors:
             seen = set()
-            unique = []
-            for n, lif, st in self._ospf_neighbors[uid]:
-                key = (n, lif)
+            unique: List[Tuple[str, str, str]] = []
+            for nb_rid, lif, st in self._ospf_neighbors[uid]:
+                key = (nb_rid, lif)
                 if key in seen:
                     continue
                 seen.add(key)
-                unique.append((n, lif, st))
+                unique.append((nb_rid, lif, st))
             self._ospf_neighbors[uid] = unique
 
     def _wildcard_to_netmask(self, wildcard: str) -> str:
@@ -503,7 +617,7 @@ class TopologySim:
 
             # Connected
             for ifn, itf in dev.interfaces.items():
-                if not itf.admin_up or not itf.has_ip():
+                if not self._is_interface_up(uid, ifn) or not itf.has_ip():
                     continue
                 ipi = itf.ip_interface()
                 if ipi is None:
@@ -522,33 +636,47 @@ class TopologySim:
 
             routes[uid] = rts
 
-        # OSPF: build graph of routers and advertised networks
+        # OSPF: build graph of routers and advertised networks keyed by router-id
         ospf_routers = [d for d in self.devices.values() if d.kind == "router" and d.ospf.enabled]
-        graph: Dict[str, Set[str]] = {r.uid: set() for r in ospf_routers}
+        rid_map: Dict[str, Optional[str]] = {r.uid: self._effective_router_id(r.uid) for r in ospf_routers}
+        rid_to_uid: Dict[str, str] = {rid: uid for uid, rid in rid_map.items() if rid}
 
-        # router-router adj if share VLAN and both enabled on that VLAN
-        for r in ospf_routers:
-            for n_uid, lif, st in self._ospf_neighbors.get(r.uid, []):
-                if n_uid in graph:
-                    graph[r.uid].add(n_uid)
+        # Only consider routers with a valid router-id
+        valid_rids = {uid: rid for uid, rid in rid_map.items() if rid}
+        graph: Dict[str, Set[str]] = {rid: set() for rid in valid_rids.values()}
 
-        # advertised networks per router
-        adv: Dict[str, Set[ipaddress.IPv4Network]] = {r.uid: set() for r in ospf_routers}
         for r in ospf_routers:
+            r_rid = valid_rids.get(r.uid)
+            if not r_rid:
+                continue
+            for nb_rid, lif, st in self._ospf_neighbors.get(r.uid, []):
+                if nb_rid in graph:
+                    graph[r_rid].add(nb_rid)
+
+        # advertised networks per router-id
+        adv: Dict[str, Set[ipaddress.IPv4Network]] = {rid: set() for rid in valid_rids.values()}
+        for r in ospf_routers:
+            r_rid = valid_rids.get(r.uid)
+            if not r_rid:
+                continue
             for ifn, itf in r.interfaces.items():
-                if not itf.admin_up or not itf.has_ip():
+                if not self._is_interface_up(r.uid, ifn) or not itf.has_ip():
                     continue
                 if not self._if_ospf_enabled(r.uid, itf):
                     continue
                 ipi = itf.ip_interface()
                 if ipi:
-                    adv[r.uid].add(ipi.network)
+                    adv[r_rid].add(ipi.network)
 
-        # For each router, shortest paths and install routes
-        for src in graph:
-            dist = {src: 0}
-            prev = {src: None}
-            q = [src]
+        # For each router-id, shortest paths and install routes
+        for src_rid in graph:
+            src_uid = rid_to_uid.get(src_rid)
+            if not src_uid:
+                continue
+
+            dist = {src_rid: 0}
+            prev = {src_rid: None}
+            q = [src_rid]
             while q:
                 cur = q.pop(0)
                 for nb in sorted(graph[cur]):
@@ -557,36 +685,37 @@ class TopologySim:
                         prev[nb] = cur
                         q.append(nb)
 
-            # compute next hop: first step from src
-            def first_hop(dst: str) -> Optional[str]:
-                if dst == src:
+            def first_hop(dst_rid: str) -> Optional[str]:
+                if dst_rid == src_rid:
                     return None
-                cur = dst
-                while prev.get(cur) is not None and prev[cur] != src:
+                cur = dst_rid
+                while prev.get(cur) is not None and prev[cur] != src_rid:
                     cur = prev[cur]
-                if prev.get(cur) == src:
+                if prev.get(cur) == src_rid:
                     return cur
                 return None
 
-            for dst, nets in adv.items():
-                if dst == src:
+            for dst_rid, nets in adv.items():
+                if dst_rid == src_rid or dst_rid not in dist:
                     continue
-                if dst not in dist:
-                    continue
-                hop = first_hop(dst)
-                if hop is None:
+                hop_rid = first_hop(dst_rid)
+                if hop_rid is None:
                     continue
 
-                # Find a shared VLAN between src and hop that is OSPF-enabled and up
-                nh_ip, out_if = self._next_hop_ip_and_out_if(src, hop)
+                hop_uid = rid_to_uid.get(hop_rid)
+                if not hop_uid:
+                    continue
+
+                nh_ip, out_if = self._next_hop_ip_and_out_if(src_uid, hop_uid)
                 if not out_if:
                     continue
 
                 for net in nets:
-                    # don't override connected
-                    if any(r.prefix == net and r.protocol == "C" for r in routes[src]):
+                    if any(r.prefix == net and r.protocol == "C" for r in routes[src_uid]):
                         continue
-                    routes[src].append(Route(prefix=net, next_hop=nh_ip, out_if=out_if, protocol="O", metric=dist[dst]))
+                    routes[src_uid].append(
+                        Route(prefix=net, next_hop=nh_ip, out_if=out_if, protocol="O", metric=dist[dst_rid])
+                    )
 
         # Deterministic ordering: longest prefix first, then protocol
         for uid in routes:
@@ -607,8 +736,13 @@ class TopologySim:
         itf = dev.interfaces.get(ifname)
         if itf is None:
             return None
-        if not itf.admin_up:
+        if not self._is_interface_up(uid, ifname):
             return None
+
+        # Router-on-a-stick: subinterfaces are bound to a VLAN by their suffix.
+        _parent, sub_vlan = self._split_subinterface(ifname)
+        if sub_vlan is not None:
+            return int(sub_vlan)
 
         # routed interfaces still live on some L2 (for ARP) if connected to switchport access/trunk.
         if itf.mode == "access":
@@ -628,14 +762,14 @@ class TopologySim:
             return int(oif.access_vlan)
         if oif.mode == "trunk":
             return 1
-        return 0
+        return self._segment_id_for_routed_link(uid, ifname)
 
     def _link_allows_vlan(self, lid: str, vlan: int) -> bool:
         l = self.links[lid]
         for end in (l.a, l.b):
             dev = self.devices[end.device]
             itf = dev.interfaces[end.ifname]
-            if not itf.admin_up:
+            if not self._is_interface_up(end.device, end.ifname):
                 return False
             if itf.mode == "access" and itf.access_vlan != vlan:
                 return False
@@ -651,7 +785,19 @@ class TopologySim:
         root = switches[0]
 
         # Build switch-switch adjacency edges that carry vlan.
-        edges: List[Tuple[str, str, str, str, str]] = []  # (lid, sw1, if1, sw2, if2)
+        # If links are bundled into an EtherChannel (matching channel-group on both ends),
+        # treat the bundle as a single logical edge for STP to avoid blocking member links.
+        edge_members: Dict[str, Dict[str, List[str]]] = {}  # edge_id -> {sw_uid: [ifnames...]}
+        edge_endpoints: Dict[str, Tuple[str, str]] = {}  # edge_id -> (sw_lo, sw_hi)
+
+        def add_edge_member(edge_id: str, sw: str, ifname: str, sw_lo: str, sw_hi: str) -> None:
+            edge_members.setdefault(edge_id, {}).setdefault(sw, []).append(ifname)
+            edge_endpoints[edge_id] = (sw_lo, sw_hi)
+
+        # First pass: gather eligible links and group by port-channel when applicable.
+        po_groups: Dict[Tuple[int, str, str], List[Tuple[str, str, str, str]]] = {}
+        solo_links: List[Tuple[str, str, str, str, str]] = []  # (lid, sw1, if1, sw2, if2)
+
         for lid, l in self.links.items():
             a, b = l.a, l.b
             da = self.devices[a.device]
@@ -660,13 +806,40 @@ class TopologySim:
                 continue
             if not self._link_allows_vlan(lid, vlan):
                 continue
-            edges.append((lid, a.device, a.ifname, b.device, b.ifname))
 
-        # BFS tree from root
+            ia = da.interfaces.get(a.ifname)
+            ib = db.interfaces.get(b.ifname)
+            cga = ia.channel_group if ia else None
+            cgb = ib.channel_group if ib else None
+            if cga is not None and cgb is not None and int(cga) == int(cgb):
+                sw_lo, sw_hi = (a.device, b.device) if a.device < b.device else (b.device, a.device)
+                po_groups.setdefault((int(cga), sw_lo, sw_hi), []).append((a.device, a.ifname, b.device, b.ifname))
+            else:
+                solo_links.append((lid, a.device, a.ifname, b.device, b.ifname))
+
+        # Materialize port-channel edges
+        for (gid, sw_lo, sw_hi), members in po_groups.items():
+            edge_id = f"Po{gid}:{sw_lo}-{sw_hi}"
+            for s1, if1, s2, if2 in members:
+                add_edge_member(edge_id, s1, if1, sw_lo, sw_hi)
+                add_edge_member(edge_id, s2, if2, sw_lo, sw_hi)
+
+        # Materialize non-bundled edges
+        for lid, s1, if1, s2, if2 in solo_links:
+            sw_lo, sw_hi = (s1, s2) if s1 < s2 else (s2, s1)
+            add_edge_member(lid, s1, if1, sw_lo, sw_hi)
+            add_edge_member(lid, s2, if2, sw_lo, sw_hi)
+
+        # BFS tree from root over logical edges
         adj: Dict[str, List[Tuple[str, str, str]]] = {sw: [] for sw in switches}
-        for lid, s1, if1, s2, if2 in edges:
-            adj[s1].append((s2, if1, lid))
-            adj[s2].append((s1, if2, lid))
+        for edge_id, by_sw in edge_members.items():
+            sw_lo, sw_hi = edge_endpoints[edge_id]
+            if sw_lo not in by_sw or sw_hi not in by_sw:
+                continue
+            lo_port = sorted(by_sw[sw_lo])[0]
+            hi_port = sorted(by_sw[sw_hi])[0]
+            adj[sw_lo].append((sw_hi, lo_port, edge_id))
+            adj[sw_hi].append((sw_lo, hi_port, edge_id))
 
         parent: Dict[str, Optional[str]] = {root: None}
         tree_links: Set[str] = set()
@@ -680,22 +853,20 @@ class TopologySim:
                     q.append(nb)
 
         blocked: Dict[Tuple[str, str], bool] = {}
-        for lid, s1, if1, s2, if2 in edges:
-            if lid in tree_links:
+        for edge_id, (sw_lo, sw_hi) in edge_endpoints.items():
+            if edge_id in tree_links:
                 continue
-            # deterministically block the higher-uid side
-            if s1 < s2:
-                blocked[(s2, if2)] = True
-            else:
-                blocked[(s1, if1)] = True
+            # deterministically block the higher-uid side of the logical edge
+            for ifn in edge_members.get(edge_id, {}).get(sw_hi, []):
+                blocked[(sw_hi, ifn)] = True
         return blocked
 
     def _l2_reachable(self, src_uid: str, src_if: str, dst_uid: str, dst_if: str, vlan: int) -> bool:
         # Graph traversal across links that allow this VLAN, respecting STP blocks on switches.
         blocked = self._stp_blocked_switch_ports(vlan)
 
-        start = (src_uid, src_if)
-        goal = (dst_uid, dst_if)
+        start = (src_uid, self._physical_ifname(src_uid, src_if))
+        goal = (dst_uid, self._physical_ifname(dst_uid, dst_if))
         seen = {start}
         q = [start]
 
@@ -703,7 +874,7 @@ class TopologySim:
             duid, dif = node
             dev = self.devices[duid]
             itf = dev.interfaces.get(dif)
-            if itf is None or not itf.admin_up:
+            if itf is None or not self._is_interface_up(duid, dif):
                 return False
             if dev.kind == "switch" and blocked.get((duid, dif), False):
                 return False
@@ -747,14 +918,14 @@ class TopologySim:
     def _l2_path(self, src_uid: str, src_if: str, dst_uid: str, dst_if: str, vlan: int) -> Optional[List[Tuple[str, str]]]:
         """Return a deterministic L2 path (list of (uid, ifname)) if reachable."""
         blocked = self._stp_blocked_switch_ports(vlan)
-        start = (src_uid, src_if)
-        goal = (dst_uid, dst_if)
+        start = (src_uid, self._physical_ifname(src_uid, src_if))
+        goal = (dst_uid, self._physical_ifname(dst_uid, dst_if))
 
         def can_transit(node: Tuple[str, str]) -> bool:
             duid, dif = node
             dev = self.devices[duid]
             itf = dev.interfaces.get(dif)
-            if itf is None or not itf.admin_up:
+            if itf is None or not self._is_interface_up(duid, dif):
                 return False
             if dev.kind == "switch" and blocked.get((duid, dif), False):
                 return False
@@ -846,7 +1017,7 @@ class TopologySim:
             if r.kind != "router" or not r.ospf.enabled:
                 continue
             for ifn, itf in r.interfaces.items():
-                if not itf.admin_up or not itf.has_ip():
+                if not self._is_interface_up(r.uid, ifn) or not itf.has_ip():
                     continue
                 if not self._if_ospf_enabled(r.uid, itf):
                     continue
@@ -860,8 +1031,17 @@ class TopologySim:
         itf = dev.interfaces.get(ifname)
         if itf is None:
             return None
+
+        # Router-on-a-stick: subinterfaces are bound to a VLAN by their suffix.
+        _parent, sub_vlan = self._split_subinterface(ifname)
+        if sub_vlan is not None:
+            return int(sub_vlan)
+
         if itf.mode == "access":
             return int(itf.access_vlan)
+        if itf.mode == "trunk":
+            # Caller decides which VLAN to forward; use 1 as default.
+            return 1
         # routed connected to switch access uses other side
         other = self.other_end(uid, ifname)
         if other is None:
@@ -872,14 +1052,17 @@ class TopologySim:
             return 0
         if oif.mode == "access":
             return int(oif.access_vlan)
-        return 0
+        if oif.mode == "trunk":
+            return 1
+        # routed-to-routed (or routed-to-host-routed): use per-link segment id
+        return self._segment_id_for_routed_link(uid, ifname)
 
     # ───────────────────────────── Routing helpers ─────────────────────────────
 
     def _out_if_for_connected(self, uid: str, net: ipaddress.IPv4Network) -> Optional[str]:
         dev = self.devices[uid]
         for ifn, itf in dev.interfaces.items():
-            if not itf.admin_up or not itf.has_ip():
+            if not self._is_interface_up(uid, ifn) or not itf.has_ip():
                 continue
             ipi = itf.ip_interface()
             if ipi and ipi.network == net:
@@ -892,7 +1075,7 @@ class TopologySim:
         nh = ipaddress.IPv4Address(next_hop)
         dev = self.devices[uid]
         for ifn, itf in dev.interfaces.items():
-            if not itf.admin_up or not itf.has_ip():
+            if not self._is_interface_up(uid, ifn) or not itf.has_ip():
                 continue
             ipi = itf.ip_interface()
             if ipi and nh in ipi.network:
@@ -971,10 +1154,6 @@ class TopologySim:
         src_itf = self.devices[src_uid].interfaces[src_if]
         src_ip = src_itf.ip
 
-        ok, acl = self._acl_check(src_uid, src_if, "out", "icmp", src_ip, dst_ip)
-        if not ok:
-            return ["% Administratively prohibited (ACL)"]
-
         # hop-by-hop routing among routers
         cur_uid = src_uid
         ttl = 32
@@ -994,8 +1173,13 @@ class TopologySim:
 
             out_if = route.out_if
             out_itf = self.devices[cur_uid].interfaces.get(out_if)
-            if out_itf is None or not out_itf.admin_up:
+            if out_itf is None or not self._is_interface_up(cur_uid, out_if):
                 return ["% Interface administratively down"]
+
+            # Outbound ACL on the egress interface (evaluated per-hop).
+            ok, acl = self._acl_check(cur_uid, out_if, "out", "icmp", src_ip, dst_ip)
+            if not ok:
+                return ["% Administratively prohibited (ACL)"]
 
             # Determine next hop IP
             nh_ip = route.next_hop or dst_ip
@@ -1009,6 +1193,9 @@ class TopologySim:
             vlan = self._vlan_for_interface(cur_uid, out_if)
             if vlan is None:
                 vlan = 0
+            _nh_parent, nh_vlan = self._split_subinterface(nh_if)
+            if nh_vlan is not None:
+                vlan = int(nh_vlan)
 
             if not self._l2_reachable(cur_uid, out_if, nh_uid, nh_if, vlan):
                 return ["% Destination unreachable"]
@@ -1062,7 +1249,7 @@ class TopologySim:
 
             out_if = route.out_if
             out_itf = self.devices[cur_uid].interfaces.get(out_if)
-            if out_itf is None or not out_itf.admin_up:
+            if out_itf is None or not self._is_interface_up(cur_uid, out_if):
                 lines.append(f"{hop:<2} * * *")
                 return lines
 
@@ -1074,6 +1261,9 @@ class TopologySim:
             nh_uid, nh_if = nh_owner
 
             vlan = self._vlan_for_interface(cur_uid, out_if) or 0
+            _nh_parent, nh_vlan = self._split_subinterface(nh_if)
+            if nh_vlan is not None:
+                vlan = int(nh_vlan)
             if not self._l2_reachable(cur_uid, out_if, nh_uid, nh_if, vlan):
                 lines.append(f"{hop:<2} * * *")
                 return lines
@@ -1096,14 +1286,14 @@ class TopologySim:
         dev = self.devices[uid]
         for ifn in sorted(dev.interfaces.keys()):
             itf = dev.interfaces[ifn]
-            if itf.admin_up and itf.has_ip():
+            if self._is_interface_up(uid, ifn) and itf.has_ip():
                 return ifn
         return None
 
     def _find_ip_owner(self, ip: str) -> Optional[Tuple[str, str]]:
         for uid, dev in self.devices.items():
             for ifn, itf in dev.interfaces.items():
-                if itf.has_ip() and itf.ip == ip and itf.admin_up:
+                if itf.has_ip() and itf.ip == ip and self._is_interface_up(uid, ifn):
                     return uid, ifn
         return None
 
@@ -1116,8 +1306,9 @@ class TopologySim:
             itf = dev.interfaces[ifn]
             ip = itf.ip if itf.ip else "unassigned"
             ok = "YES" if itf.ip else "NO"
-            status = "up" if itf.admin_up else "administratively down"
-            proto = "up" if itf.admin_up else "down"
+            up = self._is_interface_up(uid, ifn)
+            status = "up" if up else "administratively down"
+            proto = "up" if up else "down"
             lines.append(f"{ifn:<22} {ip:<15} {ok:<3} manual {status:<20} {proto}")
         return "\n".join(lines)
 
@@ -1131,8 +1322,8 @@ class TopologySim:
 
     def show_ospf_neighbor(self, uid: str) -> str:
         lines = ["Neighbor ID     State           Interface"]
-        for nb, lif, st in self.ospf_neighbors_for(uid):
-            lines.append(f"{nb:<15} {st:<15} {lif}")
+        for nb_rid, lif, st in self.ospf_neighbors_for(uid):
+            lines.append(f"{nb_rid:<15} {st:<15} {lif}")
         return "\n".join(lines)
 
     def show_vlan_brief(self, uid: str) -> str:
@@ -1216,8 +1407,9 @@ class TopologySim:
         lines = ["Routing Protocol is \"static\"" if dev.static_routes else "No static routes configured"]
         if dev.ospf.enabled:
             lines.append(f"Routing Protocol is \"ospf {dev.ospf.process_id}\"")
-            if dev.ospf.router_id:
-                lines.append(f"  Router ID {dev.ospf.router_id}")
+            rid = self._effective_router_id(uid)
+            if rid:
+                lines.append(f"  Router ID {rid}")
             if dev.ospf.networks:
                 lines.append("  Routing for Networks:")
                 for net_ip, wildcard, area in dev.ospf.networks:

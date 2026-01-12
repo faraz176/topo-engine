@@ -81,6 +81,20 @@ class CLIEngine:
             return CLIResult(output=self._help(ctx, ""), prompt=ctx.prompt())
         if stripped.endswith(" ?"):
             prefix = stripped[:-2].rstrip()
+            # Important: autocomplete relies on help, and IOS-style abbreviations should work
+            # for help exactly like they do for execution (e.g., "sh run" -> "show running-config").
+            try:
+                try:
+                    p_argv = shlex.split(prefix)
+                except Exception:
+                    p_argv = prefix.split()
+                if p_argv:
+                    p_argv = self._normalize_argv(ctx, p_argv)
+                    prefix = " ".join(p_argv)
+            except CLIError as e:
+                return CLIResult(output=str(e), prompt=ctx.prompt())
+            except Exception:
+                pass
             return CLIResult(output=self._help(ctx, prefix), prompt=ctx.prompt())
 
         # Tokenize
@@ -266,31 +280,40 @@ class CLIEngine:
         s = (ifname or "").strip()
         low = s.lower()
 
+        def split_subif(name: str) -> tuple[str, str]:
+            # Preserve subinterface suffix like ".10".
+            m = re.match(r"^([^\.]+)(\.(\d+))$", name)
+            if m:
+                return m.group(1), m.group(2)
+            return name, ""
+
+        base, suffix = split_subif(low)
+
         # Already canonical-ish
-        m = re.match(r"^(gi)\s*(\d+/\d+)$", low)
+        m = re.match(r"^(gi)\s*(\d+/\d+)$", base)
         if m:
-            return f"Gi{m.group(2)}"
-        m = re.match(r"^(fa)\s*(\d+/\d+)$", low)
+            return f"Gi{m.group(2)}{suffix}"
+        m = re.match(r"^(fa)\s*(\d+/\d+)$", base)
         if m:
-            return f"Fa{m.group(2)}"
+            return f"Fa{m.group(2)}{suffix}"
 
         # Abbreviations
-        m = re.match(r"^(g|gi|gig|giga|gigabitethernet)\s*(\d+/\d+)$", low)
+        m = re.match(r"^(g|gi|gig|giga|gigabitethernet)\s*(\d+/\d+)$", base)
         if m:
-            return f"Gi{m.group(2)}"
-        m = re.match(r"^(f|fa|fastethernet)\s*(\d+/\d+)$", low)
+            return f"Gi{m.group(2)}{suffix}"
+        m = re.match(r"^(f|fa|fastethernet)\s*(\d+/\d+)$", base)
         if m:
-            return f"Fa{m.group(2)}"
+            return f"Fa{m.group(2)}{suffix}"
 
         # If user typed just "g0/0" and this is a router-like device, prefer Gi.
         if kind == "router":
-            m = re.match(r"^g(\d+/\d+)$", low)
+            m = re.match(r"^g(\d+/\d+)$", base)
             if m:
-                return f"Gi{m.group(1)}"
+                return f"Gi{m.group(1)}{suffix}"
         if kind == "switch":
-            m = re.match(r"^f(\d+/\d+)$", low)
+            m = re.match(r"^f(\d+/\d+)$", base)
             if m:
-                return f"Fa{m.group(1)}"
+                return f"Fa{m.group(1)}{suffix}"
 
         return s
 
@@ -376,6 +399,8 @@ class CLIEngine:
             "vlan",
             "shutdown",
             "no",
+            "encapsulation",
+            "router-id",
             "switchport",
             "channel-group",
             "network",
@@ -442,6 +467,7 @@ class CLIEngine:
                 "ip access-list extended <name>",
                 "ip route <prefix> <mask> <next-hop>",
                 "vlan <id>",
+                "encapsulation dot1q <vlan>",
                 "do <exec-command>",
                 "end",
             ])
@@ -461,6 +487,7 @@ class CLIEngine:
         if ctx.mode == "config-router":
             base.extend([
                 "network <ip> <wildcard> area <area>",
+                "router-id <id>",
             ])
         if ctx.mode == "config-acl":
             base.extend([
@@ -661,6 +688,18 @@ class CLIEngine:
             ctx.sim.recompute()
             return ""
 
+        # Router-on-a-stick (simulated): accept dot1q encapsulation on subinterfaces.
+        # We infer VLAN from the subinterface suffix (e.g., Gi0/0.10) for forwarding.
+        if cmd == "encapsulation" and len(argv) >= 3 and argv[1].lower() == "dot1q":
+            # Validate VLAN token when present, but do not require it.
+            if len(argv) >= 3:
+                try:
+                    int(argv[2])
+                except Exception:
+                    raise CLIError("% Invalid input detected at '^' marker.")
+            ctx.sim.recompute()
+            return ""
+
         if cmd == "shutdown":
             itf.admin_up = False
             ctx.sim.recompute()
@@ -685,19 +724,35 @@ class CLIEngine:
             ctx.sim.recompute()
             return ""
 
-        if cmd == "switchport" and len(argv) >= 6 and argv[1:4] == ["trunk", "allowed", "vlan"]:
+        if cmd == "switchport" and len(argv) >= 5 and argv[1:4] == ["trunk", "allowed", "vlan"]:
             itf.mode = "trunk"
+
+            op = "set"  # set|add|remove
             vlan_list = argv[4]
-            allowed = set()
+            if vlan_list.lower() in ("add", "remove") and len(argv) >= 6:
+                op = vlan_list.lower()
+                vlan_list = argv[5]
+
+            parsed = set()
             for part in vlan_list.split(","):
+                part = part.strip()
+                if not part:
+                    continue
                 if "-" in part:
                     a, b = part.split("-", 1)
                     for v in range(int(a), int(b) + 1):
-                        allowed.add(v)
+                        parsed.add(v)
                 else:
-                    allowed.add(int(part))
-            itf.trunk_vlans = allowed
-            for v in allowed:
+                    parsed.add(int(part))
+
+            if op == "add":
+                itf.trunk_vlans = set(itf.trunk_vlans) | parsed
+            elif op == "remove":
+                itf.trunk_vlans = set(itf.trunk_vlans) - parsed
+            else:
+                itf.trunk_vlans = parsed
+
+            for v in itf.trunk_vlans:
                 dev.ensure_vlan(v)
             ctx.sim.recompute()
             return ""
@@ -770,6 +825,28 @@ class CLIEngine:
         if argv[0].lower() == "network" and len(argv) == 5 and argv[3].lower() == "area":
             net_ip, wildcard, area = argv[1], argv[2], argv[4]
             dev.ospf.networks.append((net_ip, wildcard, area))
+            ctx.sim.recompute()
+            return ""
+        if argv[0].lower() == "router-id" and len(argv) == 2:
+            rid = argv[1]
+            # Validate IPv4 address
+            try:
+                import ipaddress
+
+                ipaddress.IPv4Address(rid)
+            except Exception:
+                raise CLIError("% Invalid input detected at '^' marker.")
+
+            # Enforce uniqueness per process among routers with explicit router-id.
+            for other_uid, other in ctx.sim.devices.items():
+                if other_uid == ctx.uid or other.kind != "router" or not other.ospf.enabled:
+                    continue
+                if str(other.ospf.process_id) != str(dev.ospf.process_id):
+                    continue
+                if other.ospf.router_id == rid:
+                    raise CLIError("% Duplicate router-id in this OSPF process")
+
+            dev.ospf.router_id = rid
             ctx.sim.recompute()
             return ""
         raise CLIError("% Invalid input detected at '^' marker.")

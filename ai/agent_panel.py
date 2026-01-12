@@ -22,18 +22,46 @@ class AgentPanel(tk.Frame):
         master,
         get_topology_cb: Callable[[], Dict[str, Any]],
         apply_topology_cb: Callable[[Dict[str, Any]], None],
+        log_event_cb: Optional[Callable[..., None]] = None,
         **kwargs,
     ):
         super().__init__(master, bg="#14161b", **kwargs)
 
         self.get_topology_cb = get_topology_cb
         self.apply_topology_cb = apply_topology_cb
+        self.log_event_cb = log_event_cb
 
         self.agent = TopoAgent()
         self.history: List[Dict[str, str]] = []
         self.last_reply: Optional[AgentReply] = None
 
         self._build_ui()
+
+    def _log(self, kind: str, **data: Any) -> None:
+        if not self.log_event_cb:
+            return
+        try:
+            self.log_event_cb(kind, **data)
+        except TypeError:
+            # Back-compat: older callback signature expected only (kind)
+            try:
+                self.log_event_cb(kind)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _safe_json_preview(self, obj: Any, max_chars: int = 20000) -> str:
+        import json
+
+        try:
+            s = json.dumps(obj, ensure_ascii=False, indent=2, default=str)
+        except Exception:
+            s = str(obj)
+
+        if len(s) > max_chars:
+            return s[:max_chars] + "\n... (truncated)"
+        return s
 
     def _build_ui(self):
         header = tk.Label(
@@ -124,6 +152,8 @@ class AgentPanel(tk.Frame):
         if not user_text:
             return
 
+        self._log("agent_send", text=user_text, historyLen=len(self.history))
+
         self.input.delete("1.0", "end")
         self._append("user", user_text)
         self.history.append({"role": "user", "text": user_text})
@@ -133,6 +163,15 @@ class AgentPanel(tk.Frame):
             topo_state = self.get_topology_cb() or {}
         except Exception:
             topo_state = {}
+
+        # Store a readable prompt context for debugging.
+        topo_preview = self._safe_json_preview(topo_state, max_chars=20000)
+        self._log(
+            "agent_prompt",
+            userText=user_text,
+            historyLen=len(self.history),
+            topoStatePreview=topo_preview,
+        )
 
         self.send_btn.configure(state=tk.DISABLED)
 
@@ -152,6 +191,14 @@ class AgentPanel(tk.Frame):
                 self._append("assistant", reply.message)
                 self.history.append({"role": "assistant", "text": reply.message})
 
+                self._log(
+                    "agent_reply",
+                    message=reply.message,
+                    warningCount=len(reply.warnings or []),
+                    hasTopology=(reply.topology is not None),
+                    applyHint=bool(getattr(reply, "apply_hint", False)),
+                )
+
                 if reply.warnings:
                     self._append("assistant", "Warnings:\n- " + "\n- ".join(reply.warnings))
                     self.history.append({"role": "assistant", "text": "Warnings: " + "; ".join(reply.warnings)})
@@ -161,12 +208,20 @@ class AgentPanel(tk.Frame):
                     try:
                         topo_obj = reply.topology
                         topo_dict = topo_obj.model_dump() if hasattr(topo_obj, "model_dump") else topo_obj
+                        self._log(
+                            "agent_apply_topology_start",
+                            topoPreview=self._safe_json_preview(topo_dict, max_chars=20000),
+                        )
                         self.apply_topology_cb(topo_dict)
                         self._append("assistant", "Applied topology to canvas.")
                         self.history.append({"role": "assistant", "text": "Applied topology to canvas."})
+
+                        self._log("agent_apply_topology_done")
                     except Exception as e:
                         self._append("assistant", f"Apply failed: {e}")
                         self.history.append({"role": "assistant", "text": f"Apply failed: {e}"})
+
+                        self._log("agent_apply_failed", error=str(e))
 
                 self.send_btn.configure(state=tk.NORMAL)
 

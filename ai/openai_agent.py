@@ -21,11 +21,18 @@ class TopologyMeta(BaseModel):
 class TopoNode(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    id: str = Field(..., description="Unique node id (R# or SW#)")
-    type: Literal["router", "switch"] = Field(..., description="router or switch")
+    id: str = Field(..., description="Unique node id (R# / SW# / PC#)")
+    type: Literal["router", "switch", "host"] = Field(..., description="router, switch, or host")
     x: float = Field(..., description="Canvas X coordinate")
     y: float = Field(..., description="Canvas Y coordinate")
     seq: int = Field(0, description="Sequence number")
+
+
+class TopoLinkIface(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    a_if: str = Field(..., description="Interface name on endpoint a (e.g., Gi0/0, Fa0/1, Eth0)")
+    b_if: str = Field(..., description="Interface name on endpoint b")
 
 
 class TopoLink(BaseModel):
@@ -34,15 +41,37 @@ class TopoLink(BaseModel):
     a: str = Field(..., description="Endpoint node id")
     b: str = Field(..., description="Endpoint node id")
     type: str = Field("ethernet", description="Link type")
+    count: int = Field(1, description="Parallel link count")
+    ifaces: Optional[List[TopoLinkIface]] = Field(
+        default=None,
+        description="Optional explicit interface mappings for each parallel link (recommended when providing deviceConfigs).",
+    )
+
+
+class DeviceConfigEntry(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(..., description="Device id (must match a node.id)")
+    cli: Literal["ios", "pc"] = Field(
+        ..., description="Which CLI dialect to use: ios (routers/switches) or pc (hosts)"
+    )
+    commands: List[str] = Field(
+        default_factory=list,
+        description="Commands to run on that device after the topology is loaded.",
+    )
 
 
 class Topology(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    schemaVersion: int = Field(1, description="Schema version")
+    schemaVersion: int = Field(2, description="Schema version")
     meta: TopologyMeta = Field(default_factory=TopologyMeta)
     nodes: List[TopoNode] = Field(default_factory=list)
     links: List[TopoLink] = Field(default_factory=list)
+    deviceConfigs: Optional[List[DeviceConfigEntry]] = Field(
+        default=None,
+        description="Optional per-device command lists (UI will execute after topology load).",
+    )
 
 
 class AgentReply(BaseModel):
@@ -79,18 +108,31 @@ Your job:
 1) Give helpful, specific guidance (CCNP/CCIE lab ideas, validation notes, troubleshooting).
 2) When the user asks to generate or modify a topology, include a 'topology' object that matches the app schema:
    {
-     "schemaVersion": 1,
+         "schemaVersion": 2,
      "meta": {"name": "..."},
-     "nodes": [{"id":"R1","type":"router","x":123,"y":456,"seq":0}, ...],
-     "links": [{"a":"R1","b":"SW1","type":"ethernet"}, ...]
+         "nodes": [{"id":"R1","type":"router","x":123,"y":456,"seq":0}, ...],
+         "links": [{"a":"R1","b":"SW1","type":"ethernet","count":1,"ifaces":[{"a_if":"Gi0/0","b_if":"Fa0/1"}]}, ...],
+         "deviceConfigs": [{"id":"R1","cli":"ios","commands":["enable","conf t", ...]}, {"id":"PC1","cli":"pc","commands":["ip 10.0.1.10 255.255.255.0 10.0.1.1"]}, ...]
    }
 
 Constraints for topology JSON:
-- node.id must be unique (use R# for routers, SW# for switches)
-- node.type must be "router" or "switch"
+- node.id must be unique (use R# for routers, SW# for switches, PC# for hosts)
+- node.type must be "router", "switch", or "host"
 - x,y should be within a ~1200x800 canvas (roughly 0..1200, 0..800)
 - links use ids that exist in nodes
 - avoid duplicate links (a-b same as b-a)
+
+If the user asks to "configure" the topology (or asks for a fully working lab), include deviceConfigs for EVERY node:
+- Routers: include IOS commands to assign interface IPs, `no shut`, and configure OSPF.
+- Hosts: include PC commands to set `ip <ip> <mask> [gateway]`.
+
+CRITICAL (make labs actually work in the simulator):
+- Any interface you enter with `interface ...` must be explicitly brought UP with `no shutdown` unless you intentionally want it DOWN.
+- For router-on-a-stick, you must bring UP the parent physical interface (e.g., `interface Gi0/0` -> `no shutdown`) AND each subinterface (e.g., `interface Gi0/0.10` -> `no shutdown`).
+- If you configure a trunk, include `switchport mode trunk` and (when VLANs are specified) `switchport trunk allowed vlan ...`.
+- For switch ports used for forwarding (access or trunk), explicitly add `no shutdown` in each interface stanza so they come up.
+
+If your configs reference specific interface names, also provide explicit link.ifaces so the UI creates those interfaces deterministically.
 
 If you do NOT provide a topology, set apply_hint=false.
 If you DO provide a topology, set apply_hint=true.
