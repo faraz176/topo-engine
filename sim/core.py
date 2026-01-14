@@ -6,6 +6,67 @@ import ipaddress
 import re
 
 
+HARDWARE_PROFILES: Dict[str, Dict[str, float]] = {
+    # Switches
+    "OLD_ACCESS_SWITCH": {
+        "max_link_speed_mbps": 1000.0,
+        "max_forwarding_mbps": 600.0,
+        "max_pps": 200_000.0,
+        "stress_tolerance": 0.6,
+        "latency_slope": 45.0,
+        "heating_rate": 0.35,
+        "cooling_rate": 0.05,
+    },
+    "MODERN_ACCESS_SWITCH": {
+        "max_link_speed_mbps": 10_000.0,
+        "max_forwarding_mbps": 8_000.0,
+        "max_pps": 2_000_000.0,
+        "stress_tolerance": 0.85,
+        "latency_slope": 18.0,
+        "heating_rate": 0.18,
+        "cooling_rate": 0.12,
+    },
+    "MODERN_CORE_SWITCH": {
+        "max_link_speed_mbps": 100_000.0,
+        "max_forwarding_mbps": 80_000.0,
+        "max_pps": 8_000_000.0,
+        "stress_tolerance": 0.95,
+        "latency_slope": 8.0,
+        "heating_rate": 0.12,
+        "cooling_rate": 0.16,
+    },
+    # Routers
+    "OLD_ROUTER": {
+        "max_link_speed_mbps": 1000.0,
+        "max_forwarding_mbps": 400.0,
+        "max_pps": 150_000.0,
+        "stress_tolerance": 0.55,
+        "latency_slope": 50.0,
+        "heating_rate": 0.38,
+        "cooling_rate": 0.05,
+    },
+    "MODERN_ROUTER": {
+        "max_link_speed_mbps": 10_000.0,
+        "max_forwarding_mbps": 9_000.0,
+        "max_pps": 3_000_000.0,
+        "stress_tolerance": 0.9,
+        "latency_slope": 14.0,
+        "heating_rate": 0.16,
+        "cooling_rate": 0.14,
+    },
+    # Hosts act as well-tuned endpoints; keep limits generous so congestion emerges from the network, not hosts.
+    "HOST_OPTIMIZED": {
+        "max_link_speed_mbps": 10_000.0,
+        "max_forwarding_mbps": 9_000.0,
+        "max_pps": 5_000_000.0,
+        "stress_tolerance": 1.0,
+        "latency_slope": 5.0,
+        "heating_rate": 0.05,
+        "cooling_rate": 0.2,
+    },
+}
+
+
 def _norm_uid(uid: str) -> str:
     return (uid or "").strip()
 
@@ -63,6 +124,11 @@ class Interface:
     ip: Optional[str] = None
     mask: Optional[str] = None
 
+    description: Optional[str] = None
+    bandwidth_kbps: Optional[int] = None
+    duplex: Optional[str] = None
+    speed: Optional[str] = None
+
     # L2
     mode: str = "routed"  # routed|access|trunk
     access_vlan: int = 1
@@ -72,9 +138,19 @@ class Interface:
     channel_group: Optional[int] = None
     channel_mode: Optional[str] = None  # active|passive|on
 
+    # QoS (placeholder)
+    service_policy_in: Optional[str] = None
+    service_policy_out: Optional[str] = None
+
     # ACL
     acl_in: Optional[str] = None
     acl_out: Optional[str] = None
+
+    # L3 helpers / services
+    helper_addresses: List[str] = field(default_factory=list)
+    nat_inside: bool = False
+    nat_outside: bool = False
+    directed_broadcast_disabled: bool = True
 
     def has_ip(self) -> bool:
         return bool(self.ip and self.mask)
@@ -90,10 +166,32 @@ class Device:
     uid: str
     kind: str  # router|switch|host
     interfaces: Dict[str, Interface] = field(default_factory=dict)
+    hardware_profile: str = ""
+
+    # Identity
+    hostname: Optional[str] = None
+    enable_secret: Optional[str] = None
+    usernames: Dict[str, str] = field(default_factory=dict)  # user -> secret
+    logging_host: Optional[str] = None
+    clock: Optional[str] = None
+    banner_motd: Optional[str] = None
+
+    # Routing & NAT
+    ip_routing: bool = True
+    nat_pools: Dict[str, Tuple[str, str, Optional[str]]] = field(default_factory=dict)  # name -> (start, end, mask)
+    nat_acls: Dict[str, List[Tuple[str, str, str, str]]] = field(default_factory=dict)  # name -> entries
+    nat_inside_source_list: List[Tuple[str, Optional[str], bool]] = field(default_factory=list)  # acl, iface/pool, overload
+    nat_inside_static: List[Tuple[str, str]] = field(default_factory=list)  # local -> global
+    nat_translations: List[Tuple[str, str]] = field(default_factory=list)
+
+    # QoS (placeholder)
+    class_maps: Dict[str, dict] = field(default_factory=dict)
+    policy_maps: Dict[str, dict] = field(default_factory=dict)
 
     # Host-only (PC) convenience settings
     host_gateway: Optional[str] = None
     host_dns: Optional[str] = None
+    throughput_pct: float = 0.3  # fraction of NIC capacity offered as traffic (0.0-1.0)
 
     # Switch state
     vlans: Dict[int, str] = field(default_factory=lambda: {1: "default"})
@@ -148,6 +246,17 @@ class TopologySim:
         self._next_link = 1
         self._if_counters: Dict[str, int] = {}
 
+        # Stress/load state
+        self.link_load: Dict[str, dict] = {}
+        self.device_load: Dict[str, dict] = {}
+        self._target_link_load: Dict[str, dict] = {}
+        self._target_device_load: Dict[str, dict] = {}
+        self.traffic_active: bool = False
+        self.tick_interval_sec: float = 0.1
+        # Fast visual response without instant saturation
+        self.ramp_seconds: float = 1.5
+        self._baseline_stress: float = 0.02
+
         # Cached recompute outputs
         self._routes: Dict[str, List[Route]] = {}
         # uid -> list of (neighbor_router_id, local_if, state)
@@ -158,14 +267,25 @@ class TopologySim:
     def reset(self):
         self.__init__()
 
-    def add_device(self, uid: str, kind: str):
+    def _default_profile_for_kind(self, kind: str) -> str:
+        kind = (kind or "router").lower()
+        if kind == "switch":
+            return "MODERN_ACCESS_SWITCH"
+        if kind == "host":
+            return "HOST_OPTIMIZED"
+        return "MODERN_ROUTER"
+
+    def add_device(self, uid: str, kind: str, hardware_profile: Optional[str] = None):
         uid = _norm_uid(uid)
         kind = (kind or "router").lower()
         if kind not in ("router", "switch", "host"):
             kind = "router"
         if uid in self.devices:
             return
-        self.devices[uid] = Device(uid=uid, kind=kind)
+        profile = hardware_profile or self._default_profile_for_kind(kind)
+        if profile not in HARDWARE_PROFILES:
+            profile = self._default_profile_for_kind(kind)
+        self.devices[uid] = Device(uid=uid, kind=kind, hardware_profile=profile)
         self._if_counters[uid] = 0
         self.recompute()
 
@@ -181,12 +301,36 @@ class TopologySim:
         self._if_counters.pop(uid, None)
         self.recompute()
 
+    def set_device_profile(self, uid: str, profile: str):
+        uid = _norm_uid(uid)
+        dev = self.devices.get(uid)
+        if dev is None:
+            return
+        if profile not in HARDWARE_PROFILES:
+            profile = self._default_profile_for_kind(dev.kind)
+        dev.hardware_profile = profile
+        self.recompute()
+
+    def set_host_throughput(self, uid: str, throughput_pct: float):
+        """Set offered throughput for a host as a fraction of its NIC capacity (0.0-1.0)."""
+        uid = _norm_uid(uid)
+        dev = self.devices.get(uid)
+        if dev is None or dev.kind != "host":
+            return
+        pct = max(0.0, min(1.0, throughput_pct))
+        dev.throughput_pct = pct
+        self.recompute()
+
     def ensure_interface(self, uid: str, ifname: str) -> Interface:
         dev = self.devices[uid]
         if ifname not in dev.interfaces:
             itf = Interface(name=ifname, mac=_mac_from_text(f"{uid}:{ifname}"))
             # PCs are "plugged in" by default.
             if dev.kind == "host" and ifname.startswith("Eth"):
+                itf.admin_up = True
+            # Switches: layer 2 ports typically default to "no shutdown" in real hardware.
+            # This avoids requiring explicit "no shutdown" commands for basic connectivity.
+            if dev.kind == "switch":
                 itf.admin_up = True
             dev.interfaces[ifname] = itf
             self._sync_if_counter(uid)
@@ -410,6 +554,7 @@ class TopologySim:
         dev = self.devices[uid]
         return {
             "kind": dev.kind,
+            "hardware_profile": dev.hardware_profile,
             "host": {
                 "gateway": dev.host_gateway,
                 "dns": dev.host_dns,
@@ -454,6 +599,13 @@ class TopologySim:
         if isinstance(cfg, dict):
             if cfg.get("kind") in ("router", "switch", "host"):
                 dev.kind = cfg["kind"]
+            hw = cfg.get("hardware_profile")
+            if hw:
+                self.set_device_profile(uid, str(hw))
+            else:
+                # Ensure a profile exists after kind changes.
+                if not dev.hardware_profile:
+                    self.set_device_profile(uid, self._default_profile_for_kind(dev.kind))
 
             host = cfg.get("host")
             if isinstance(host, dict):
@@ -542,6 +694,7 @@ class TopologySim:
     def recompute(self):
         self._compute_ospf_neighbors()
         self._compute_routes()
+        # Targets will be recalculated on the next tick; keep current stress/state untouched to avoid jumps.
 
     def _effective_router_id(self, uid: str) -> Optional[str]:
         dev = self.devices.get(uid)
@@ -1167,77 +1320,76 @@ class TopologySim:
         except Exception:
             return ["% Invalid IP address"]
 
-        # If destination is one of our interface IPs, succeed if local can reach it.
-        dst_owner = self._find_ip_owner(dst_ip)
-        if dst_owner is None:
-            # still route toward it; will fail with unreachable
-            pass
+        self.compute_load_state()
 
-        # choose a source interface with IP
         src_if = self._pick_source_interface(src_uid)
         if not src_if:
             return ["% No source interface with IP"]
 
-        src_itf = self.devices[src_uid].interfaces[src_if]
-        src_ip = src_itf.ip
-
-        # hop-by-hop routing among routers
-        cur_uid = src_uid
-        ttl = 32
-        visited = []
-
-        while ttl > 0:
-            ttl -= 1
-            visited.append(cur_uid)
-            # if current device owns dst
-            owner = self._find_ip_owner(dst_ip)
-            if owner and owner[0] == cur_uid:
-                return ["!!!!!", f"Success rate is 100 percent (1/1), round-trip min/avg/max = 1/1/1 ms"]
-
-            route = self.lookup_route(cur_uid, dst_ip)
-            if route is None:
-                return ["% Destination unreachable"]
-
-            out_if = route.out_if
-            out_itf = self.devices[cur_uid].interfaces.get(out_if)
-            if out_itf is None or not self._is_interface_up(cur_uid, out_if):
-                return ["% Interface administratively down"]
-
-            # Outbound ACL on the egress interface (evaluated per-hop).
-            ok, acl = self._acl_check(cur_uid, out_if, "out", "icmp", src_ip, dst_ip)
+        src_ip = self.devices[src_uid].interfaces[src_if].ip
+        if src_ip:
+            ok, _acl = self._acl_check(src_uid, src_if, "out", "icmp", src_ip, dst_ip)
             if not ok:
                 return ["% Administratively prohibited (ACL)"]
 
-            # Determine next hop IP
-            nh_ip = route.next_hop or dst_ip
-
-            # Find next hop device/interface on same connected segment
-            nh_owner = self._find_ip_owner(nh_ip)
-            if nh_owner is None:
-                return ["% Destination unreachable"]
-            nh_uid, nh_if = nh_owner
-
-            vlan = self._vlan_for_interface(cur_uid, out_if)
-            if vlan is None:
-                vlan = 0
-            _nh_parent, nh_vlan = self._split_subinterface(nh_if)
-            if nh_vlan is not None:
-                vlan = int(nh_vlan)
-
-            if not self._l2_reachable(cur_uid, out_if, nh_uid, nh_if, vlan):
-                return ["% Destination unreachable"]
-
-            # ARP/MAC learning (deterministic, simplified)
-            self._resolve_arp_and_learn(cur_uid, out_if, nh_uid, nh_if, vlan, nh_ip)
-
-            # Inbound ACL on next hop interface
-            ok, acl = self._acl_check(nh_uid, nh_if, "in", "icmp", src_ip, dst_ip)
-            if not ok:
+        path, reason = self._forwarding_path(src_uid, dst_ip)
+        if path is None:
+            if reason == "acl":
                 return ["% Administratively prohibited (ACL)"]
+            return ["% Destination unreachable"]
 
-            cur_uid = nh_uid
+        # Aggregate latency and drop probability along the path.
+        unique_devices: Set[str] = set()
+        total_queue_ms = 0.0
+        combined_drop = 0.0
 
-        return ["% Time to live exceeded"]
+        for cur_uid, _out_if, nh_uid, _nh_if, lid in path:
+            unique_devices.add(cur_uid)
+            unique_devices.add(nh_uid)
+            ll = self.link_load.get(lid, {})
+            total_queue_ms += ll.get("queue_delay_ms", 0.0)
+            dp = ll.get("drop_prob", 0.0)
+            combined_drop = 1 - (1 - combined_drop) * (1 - dp)
+
+        for duid in unique_devices:
+            dstats = self.device_load.get(duid, {})
+            total_queue_ms += dstats.get("delay_ms", 0.0)
+            dp = dstats.get("drop_prob", 0.0)
+            combined_drop = 1 - (1 - combined_drop) * (1 - dp)
+
+        base_rtt_ms = max(1.0, len(path) * 2.0)
+        est_rtt_ms = base_rtt_ms + total_queue_ms
+
+        def _deterministic_sample(seed: str) -> float:
+            h = 0
+            for ch in seed.encode("utf-8"):
+                h = (h * 131 + ch) & 0xFFFFFFFF
+            return (h % 10_000) / 10_000.0
+
+        probes = 5
+        tokens: List[str] = []
+        successes: List[float] = []
+        for idx in range(probes):
+            chance = _deterministic_sample(f"{src_uid}->{dst_ip}:{idx}")
+            if chance < combined_drop:
+                tokens.append(".")
+            else:
+                tokens.append("!")
+                successes.append(est_rtt_ms)
+
+        if not successes:
+            return [
+                "".join(tokens),
+                "Success rate is 0 percent (0/5), round-trip min/avg/max = 0/0/0 ms",
+            ]
+
+        mn = int(min(successes))
+        mx = int(max(successes))
+        avg = int(sum(successes) / len(successes))
+        return [
+            "".join(tokens),
+            f"Success rate is {int(len(successes)/probes*100)} percent ({len(successes)}/{probes}), round-trip min/avg/max = {mn}/{avg}/{mx} ms",
+        ]
 
     def traceroute(self, src_uid: str, dst_ip: str) -> List[str]:
         src_uid = _norm_uid(src_uid)
@@ -1308,6 +1460,297 @@ class TopologySim:
 
         lines.append(f"{hop:<2} * * *")
         return lines
+
+    # ───────────────────────────── Load / stress model ─────────────────────────────
+
+    def _profile_for(self, uid: str) -> Dict[str, float]:
+        dev = self.devices.get(uid)
+        if dev is None:
+            return HARDWARE_PROFILES[self._default_profile_for_kind("router")]
+        prof = HARDWARE_PROFILES.get(dev.hardware_profile)
+        if prof:
+            return prof
+        return HARDWARE_PROFILES[self._default_profile_for_kind(dev.kind)]
+
+    def _link_capacity_mbps(self, lid: str) -> float:
+        base_capacity = 1_000.0  # conceptual 1 Gbps default media
+        link = self.links.get(lid)
+        if link is None:
+            return base_capacity
+        a_prof = self._profile_for(link.a.device)
+        b_prof = self._profile_for(link.b.device)
+        cap = min(base_capacity, a_prof.get("max_link_speed_mbps", base_capacity), b_prof.get("max_link_speed_mbps", base_capacity))
+        return max(cap, 1.0)
+
+    def _flow_offered_load(self, host_uid: str) -> float:
+        """Return offered Mbps for a host based on configured throughput_pct and link capacity."""
+        dev = self.devices.get(host_uid)
+        if dev is None or dev.kind != "host":
+            return 0.0
+        if not dev.interfaces:
+            return 0.0
+
+        pct = max(0.0, min(1.0, getattr(dev, "throughput_pct", 0.0)))
+
+        # Choose first up interface with an attached link.
+        for ifn, itf in dev.interfaces.items():
+            if not self._is_interface_up(host_uid, ifn):
+                continue
+            lid = self.link_for_end(host_uid, ifn)
+            if not lid:
+                continue
+            cap = self._link_capacity_mbps(lid)
+            return pct * cap
+        return 0.0
+
+    def _forwarding_path(self, src_uid: str, dst_ip: str) -> Tuple[Optional[List[Tuple[str, str, str, str, str]]], Optional[str]]:
+        """Return hop list: (cur_uid, out_if, nh_uid, nh_if, link_id) plus optional failure reason."""
+        path: List[Tuple[str, str, str, str, str]] = []
+        cur_uid = src_uid
+        ttl = 32
+        visited: set[str] = set()
+
+        def fail(reason: Optional[str] = None) -> Tuple[None, Optional[str]]:
+            return None, reason
+
+        # pick a stable source IP to honor ACL checks
+        src_if = self._pick_source_interface(src_uid)
+        src_ip = self.devices[src_uid].interfaces[src_if].ip if src_if else None
+
+        while ttl > 0:
+            ttl -= 1
+            if cur_uid in visited:
+                return fail()
+            visited.add(cur_uid)
+
+            owner = self._find_ip_owner(dst_ip)
+            if owner and owner[0] == cur_uid:
+                return path, None
+
+            route = self.lookup_route(cur_uid, dst_ip)
+            if route is None:
+                return fail()
+
+            out_if = route.out_if
+            out_itf = self.devices[cur_uid].interfaces.get(out_if)
+            if out_itf is None or not self._is_interface_up(cur_uid, out_if):
+                return fail()
+
+            if src_ip:
+                ok, _acl = self._acl_check(cur_uid, out_if, "out", "icmp", src_ip, dst_ip)
+                if not ok:
+                    return fail("acl")
+
+            nh_ip = route.next_hop or dst_ip
+            nh_owner = self._find_ip_owner(nh_ip)
+            if nh_owner is None:
+                return fail()
+            nh_uid, nh_if = nh_owner
+
+            vlan = self._vlan_for_interface(cur_uid, out_if) or 0
+            _nh_parent, nh_vlan = self._split_subinterface(nh_if)
+            if nh_vlan is not None:
+                vlan = int(nh_vlan)
+            if not self._l2_reachable(cur_uid, out_if, nh_uid, nh_if, vlan):
+                return fail()
+
+            lid = self.link_for_end(cur_uid, out_if)
+            if not lid:
+                return fail()
+
+            if src_ip:
+                ok, _acl = self._acl_check(nh_uid, nh_if, "in", "icmp", src_ip, dst_ip)
+                if not ok:
+                    return fail("acl")
+
+            # Resolve ARP and learn MACs along the path to populate switch tables deterministically.
+            ok, _mac = self._resolve_arp_and_learn(cur_uid, out_if, nh_uid, nh_if, vlan, nh_ip)
+            if not ok:
+                return fail()
+
+            path.append((cur_uid, out_if, nh_uid, nh_if, lid))
+            cur_uid = nh_uid
+
+        return fail()
+
+    def start_traffic(self):
+        """Enable traffic generation; targets will be set on the next tick."""
+        self.traffic_active = True
+        # Seed a minimal stress so colors show activity without jumping.
+        for uid, dev in self.devices.items():
+            if dev.kind == "host":
+                continue
+            state = self.device_load.setdefault(uid, {
+                "throughput_mbps": 0.0,
+                "flows": 0,
+                "stress_level": self._baseline_stress,
+                "delay_ms": 0.0,
+                "drop_prob": 0.0,
+                "profile": dev.hardware_profile,
+            })
+            state["stress_level"] = max(state.get("stress_level", 0.0), self._baseline_stress)
+            state["profile"] = dev.hardware_profile
+        self.compute_load_state()
+
+    def stop_traffic(self):
+        """Disable traffic; targets decay to zero and stress will cool down."""
+        self.traffic_active = False
+        self.compute_load_state()
+
+    def tick(self):
+        """Advance simulation by one tick: ramp loads, update stress, decay when idle."""
+        self.compute_load_state()
+
+        alpha = self.tick_interval_sec / max(0.1, self.ramp_seconds)
+        alpha = max(0.2, min(0.6, alpha))
+
+        # Ramp link loads toward targets (and decay old entries)
+        link_ids = set(self._target_link_load.keys()) | set(self.link_load.keys())
+        for lid in link_ids:
+            tinfo = self._target_link_load.get(lid, {})
+            prev = self.link_load.get(lid, {})
+            cap = tinfo.get("capacity_mbps", prev.get("capacity_mbps", 1.0))
+            tgt = tinfo.get("target_mbps", 0.0)
+            state = self.link_load.setdefault(lid, {
+                "load_mbps": 0.0,
+                "capacity_mbps": cap,
+                "utilization": 0.0,
+                "queue_delay_ms": 0.0,
+                "drop_prob": 0.0,
+            })
+            state["capacity_mbps"] = cap
+            cur = state.get("load_mbps", 0.0)
+            cur += (tgt - cur) * alpha
+            cur = max(0.0, cur)
+            util = cur / max(1.0, cap)
+            queue_delay = max(0.0, util - 0.6) * 8.0  # slow growth as utilization rises
+            if util < 0.85:
+                drop = 0.0
+            elif util < 1.05:
+                drop = (util - 0.85) / 0.2 * 0.08
+            else:
+                drop = 0.08 + (util - 1.05) / 0.5 * 0.6
+            drop = max(0.0, min(1.0, drop))
+            state.update({
+                "load_mbps": cur,
+                "utilization": util,
+                "queue_delay_ms": queue_delay,
+                "drop_prob": drop,
+            })
+
+        # Ramp device throughput targets into stress accumulation
+        device_ids = set(self.devices.keys()) | set(self.device_load.keys())
+        for uid in device_ids:
+            dev = self.devices.get(uid)
+            prof = self._profile_for(uid)
+            state = self.device_load.setdefault(uid, {
+                "throughput_mbps": 0.0,
+                "flows": 0,
+                "stress_level": 0.0,
+                "delay_ms": 0.0,
+                "drop_prob": 0.0,
+                "profile": dev.hardware_profile if dev else self._default_profile_for_kind("router"),
+            })
+            tgt = self._target_device_load.get(uid, {"throughput_mbps": 0.0, "flows": 0})
+            cur_thr = state.get("throughput_mbps", 0.0)
+            tgt_thr = tgt.get("throughput_mbps", 0.0)
+            cur_thr += (tgt_thr - cur_thr) * alpha
+            state["throughput_mbps"] = max(0.0, cur_thr)
+            state["flows"] = tgt.get("flows", 0)
+
+            if dev is None or dev.kind == "host":
+                state["stress_level"] = 0.0
+                state["delay_ms"] = 0.0
+                state["drop_prob"] = 0.0
+                state["profile"] = dev.hardware_profile if dev else state.get("profile")
+                continue
+
+            stress = state.get("stress_level", 0.0)
+            util_ratio = state["throughput_mbps"] / max(1.0, prof.get("max_forwarding_mbps", 1.0))
+            util_factor = min(2.0, util_ratio ** 1.5)
+            # Heating slows as stress rises; cooling strengthens slightly with stress to create an equilibrium.
+            heating = prof.get("heating_rate", 0.2) * util_factor * (1.0 - stress) * self.tick_interval_sec
+            cooling = prof.get("cooling_rate", 0.1) * (0.35 + 0.65 * stress) * self.tick_interval_sec
+            stress = stress + heating - cooling
+            stress = max(0.0, min(1.0, stress))
+            # latency emerges when stress > 0.5
+            stress_delay = max(0.0, stress - 0.5) * prof.get("latency_slope", 10.0)
+            # drop probability rises only after 0.6
+            tol = prof.get("stress_tolerance", 0.75)
+            if stress < min(0.6, tol):
+                drop_prob = 0.0
+            elif stress < max(0.8, tol + 0.15):
+                hi = max(0.8, tol + 0.15)
+                lo = min(0.6, tol)
+                drop_prob = (stress - lo) / (hi - lo) * 0.1  # rare drops
+            else:
+                hi = max(0.8, tol + 0.15)
+                drop_prob = 0.1 + (stress - hi) / max(0.2, 1.0 - hi) * 0.6  # frequent at high stress
+            drop_prob = max(0.0, min(1.0, drop_prob))
+            state.update({
+                "stress_level": stress,
+                "delay_ms": stress_delay,
+                "drop_prob": drop_prob,
+                "profile": dev.hardware_profile,
+            })
+
+    def compute_load_state(self):
+        """Compute targets for load; actual load/stress evolve in tick()."""
+        targets_links: Dict[str, dict] = {lid: {
+            "target_mbps": 0.0,
+            "capacity_mbps": self._link_capacity_mbps(lid),
+        } for lid in self.links}
+
+        targets_devices: Dict[str, dict] = {uid: {"throughput_mbps": 0.0, "flows": 0} for uid in self.devices}
+
+        if not self.traffic_active:
+            self._target_link_load = targets_links
+            self._target_device_load = targets_devices
+            return
+
+        # Identify hosts with IP addresses to generate traffic pairs.
+        hosts_with_ip: List[Tuple[str, str]] = []
+        for uid, dev in self.devices.items():
+            if dev.kind != "host":
+                continue
+            for ifn, itf in dev.interfaces.items():
+                if self._is_interface_up(uid, ifn) and itf.ip:
+                    hosts_with_ip.append((uid, itf.ip))
+                    break
+
+        if hosts_with_ip:
+            for src_uid, _src_ip in hosts_with_ip:
+                offered = self._flow_offered_load(src_uid)
+                if offered <= 0:
+                    continue
+                peers = [d for d in hosts_with_ip if d[0] != src_uid]
+                if not peers:
+                    continue
+                per_flow_mbps = offered / len(peers)
+                for dst_uid, dst_ip in peers:
+                    path, _reason = self._forwarding_path(src_uid, dst_ip)
+                    if not path:
+                        continue
+                    traversed_devices: Set[str] = set()
+                    for cur_uid, _out_if, nh_uid, _nh_if, lid in path:
+                        tl = targets_links.get(lid)
+                        if tl is not None:
+                            tl["target_mbps"] += per_flow_mbps
+                        for duid in (cur_uid, nh_uid):
+                            ddev = self.devices.get(duid)
+                            if ddev is None or ddev.kind == "host":
+                                continue
+                            traversed_devices.add(duid)
+                    for duid in traversed_devices:
+                        entry = targets_devices.setdefault(duid, {
+                            "throughput_mbps": 0.0,
+                            "flows": 0,
+                        })
+                        entry["throughput_mbps"] += per_flow_mbps
+                        entry["flows"] += 1
+
+        self._target_link_load = targets_links
+        self._target_device_load = targets_devices
 
     def _pick_source_interface(self, uid: str) -> Optional[str]:
         dev = self.devices[uid]
@@ -1472,10 +1915,106 @@ class TopologySim:
                 lines.append(f" {idx} {r.action} {r.protocol} {r.src} {r.dst} (hitcnt={r.hits})")
         return "\n".join(lines) if lines else "% No access lists configured"
 
+    def show_startup_config(self, uid: str) -> str:
+        # Placeholder: mirror running-config
+        return self.show_running_config(uid)
+
+    def show_version(self, uid: str) -> str:
+        dev = self.devices[uid]
+        hn = dev.hostname or dev.uid
+        return f"Cisco IOS Software, TopoSim Software (Simulator)\nDevice name: {hn}\nSystem image file: sim://topsim\n"
+
+    def show_arp(self, uid: str) -> str:
+        dev = self.devices[uid]
+        lines = ["Protocol  Address          Age (min)  Hardware Addr   Type   Interface"]
+        for ifname, entries in dev.arp_table.items():
+            for ip, mac in entries.items():
+                lines.append(f"Internet  {ip:<15}  0          {mac:<15}  ARPA   {ifname}")
+        return "\n".join(lines) if len(lines) > 1 else "% Incomplete ARP table"
+
+    def show_interfaces(self, uid: str) -> str:
+        dev = self.devices[uid]
+        lines: List[str] = []
+        for ifn, itf in sorted(dev.interfaces.items()):
+            lines.append(f"{ifn} is {'up' if itf.admin_up else 'administratively down'}, line protocol is {'up' if itf.admin_up else 'down'}")
+            if itf.ip and itf.mask:
+                lines.append(f"  Internet address is {itf.ip}/{itf.mask}")
+            lines.append(f"  MTU 1500 bytes, BW {100000} Kbit")
+        return "\n".join(lines) if lines else "% No interfaces configured"
+
+    def show_vlan(self, uid: str) -> str:
+        dev = self.devices[uid]
+        lines = ["VLAN Name                             Status    Ports"]
+        for vid, name in sorted(dev.vlans.items()):
+            lines.append(f"{vid:<4} {name:<32} active    ")
+        return "\n".join(lines)
+
+    def show_cdp_neighbors(self, uid: str) -> str:
+        return "% CDP not simulated; placeholder"
+
+    def show_lldp_neighbors(self, uid: str) -> str:
+        return "% LLDP not simulated; placeholder"
+
+    def show_ip_nat_translations(self, uid: str) -> str:
+        dev = self.devices[uid]
+        if not dev.nat_translations:
+            return "% No NAT translations"
+        lines = ["Pro  Inside global         Inside local"]
+        for g, l in dev.nat_translations:
+            lines.append(f"icmp {g:<20} {l:<15}")
+        return "\n".join(lines)
+
+    def show_ip_nat_statistics(self, uid: str) -> str:
+        dev = self.devices[uid]
+        cnt = len(dev.nat_translations)
+        return f"Total translations: {cnt}\nOutside interfaces: \nInside interfaces: "
+
+    def show_class_map(self, uid: str) -> str:
+        dev = self.devices[uid]
+        if not dev.class_maps:
+            return "% No class map configured"
+        lines: List[str] = []
+        for name, entry in sorted(dev.class_maps.items()):
+            lines.append(f"Class Map match-{entry.get('match', 'all')} {name}")
+            for m in entry.get("matches", []):
+                lines.append(f"  match {m}")
+        return "\n".join(lines)
+
+    def show_policy_map(self, uid: str) -> str:
+        dev = self.devices[uid]
+        if not dev.policy_maps:
+            return "% No policy map configured"
+        lines: List[str] = []
+        for name, entry in sorted(dev.policy_maps.items()):
+            lines.append(f"Policy Map {name}")
+            for cls, actions in sorted(entry.get("classes", {}).items()):
+                lines.append(f"  Class {cls}")
+                for act in actions:
+                    lines.append(f"    {act}")
+        return "\n".join(lines)
+
+    def show_policy_map_interface(self, uid: str, ifname: Optional[str] = None) -> str:
+        dev = self.devices[uid]
+        targets = []
+        if ifname:
+            if ifname in dev.interfaces:
+                targets = [ifname]
+            else:
+                return "% Interface not found"
+        else:
+            targets = sorted(dev.interfaces.keys())
+        lines: List[str] = []
+        for ifn in targets:
+            itf = dev.interfaces[ifn]
+            lines.append(f"{ifn}")
+            lines.append(f" Service-policy input: {itf.service_policy_in or 'not set'}")
+            lines.append(f" Service-policy output: {itf.service_policy_out or 'not set'}")
+        return "\n".join(lines) if lines else "% No interfaces configured"
+
     def show_running_config(self, uid: str) -> str:
         dev = self.devices[uid]
         lines: List[str] = []
-        lines.append(f"hostname {dev.uid}")
+        lines.append(f"hostname {dev.hostname or dev.uid}")
 
         # VLANs (switch)
         if dev.kind == "switch":
@@ -1497,6 +2036,14 @@ class TopologySim:
         for ifn in sorted(dev.interfaces.keys()):
             itf = dev.interfaces[ifn]
             lines.append(f"interface {ifn}")
+            if itf.description:
+                lines.append(f" description {itf.description}")
+            if itf.bandwidth_kbps:
+                lines.append(f" bandwidth {itf.bandwidth_kbps}")
+            if itf.duplex:
+                lines.append(f" duplex {itf.duplex}")
+            if itf.speed:
+                lines.append(f" speed {itf.speed}")
             if itf.mode in ("access", "trunk"):
                 lines.append(" switchport")
                 lines.append(f" switchport mode {itf.mode}")
@@ -1506,10 +2053,21 @@ class TopologySim:
                     lines.append(f" switchport trunk allowed vlan {','.join(str(v) for v in sorted(itf.trunk_vlans))}")
             if itf.ip and itf.mask:
                 lines.append(f" ip address {itf.ip} {itf.mask}")
+            if itf.helper_addresses:
+                for ha in itf.helper_addresses:
+                    lines.append(f" ip helper-address {ha}")
             if itf.acl_in:
                 lines.append(f" ip access-group {itf.acl_in} in")
             if itf.acl_out:
                 lines.append(f" ip access-group {itf.acl_out} out")
+            if itf.nat_inside:
+                lines.append(" ip nat inside")
+            if itf.nat_outside:
+                lines.append(" ip nat outside")
+            if itf.service_policy_in:
+                lines.append(f" service-policy input {itf.service_policy_in}")
+            if itf.service_policy_out:
+                lines.append(f" service-policy output {itf.service_policy_out}")
             lines.append(" no shutdown" if itf.admin_up else " shutdown")
             lines.append("!")
 
@@ -1518,6 +2076,10 @@ class TopologySim:
             if nh:
                 lines.append(f"ip route {prefix} {mask} {nh}")
 
+        # IP routing toggle
+        if not dev.ip_routing:
+            lines.append("no ip routing")
+
         # OSPF
         if dev.ospf.enabled:
             lines.append(f"router ospf {dev.ospf.process_id}")
@@ -1525,6 +2087,40 @@ class TopologySim:
                 lines.append(f" router-id {dev.ospf.router_id}")
             for net_ip, wildcard, area in dev.ospf.networks:
                 lines.append(f" network {net_ip} {wildcard} area {area}")
+            lines.append("!")
+
+        # NAT placeholders
+        for name, (start, end, mask) in dev.nat_pools.items():
+            lines.append(f"ip nat pool {name} {start} {end} netmask {mask or ''}".strip())
+        for acl, target, overload in dev.nat_inside_source_list:
+            if target:
+                lines.append(f"ip nat inside source list {acl} interface {target}{' overload' if overload else ''}")
+        for local, glob in dev.nat_inside_static:
+            lines.append(f"ip nat inside source static {local} {glob}")
+
+        # Banner / logging / auth
+        if dev.banner_motd:
+            lines.append(f"banner motd {dev.banner_motd}")
+        if dev.logging_host:
+            lines.append(f"logging {dev.logging_host}")
+        if dev.enable_secret:
+            lines.append(f"enable secret {dev.enable_secret}")
+        for user, pw in dev.usernames.items():
+            lines.append(f"username {user} secret {pw}")
+
+        # QoS (placeholder)
+        for name, entry in dev.class_maps.items():
+            lines.append(f"class-map match-{entry.get('match', 'all')} {name}")
+            for m in entry.get("matches", []):
+                lines.append(f" match {m}")
+            lines.append("!")
+
+        for name, entry in dev.policy_maps.items():
+            lines.append(f"policy-map {name}")
+            for cls, actions in entry.get("classes", {}).items():
+                lines.append(f" class {cls}")
+                for act in actions:
+                    lines.append(f"  {act}")
             lines.append("!")
 
         lines.append("end")

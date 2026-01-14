@@ -7,5 +7,6 @@ from .core import TopologySim
 from .cli import CLIEngine
 from .pc_cli import PCCLIEngine
 from .authority import AuthorityModel
+from .visual_stress import VisualStressEngine
 
-__all__ = ["TopologySim", "CLIEngine", "PCCLIEngine", "AuthorityModel"]
+__all__ = ["TopologySim", "CLIEngine", "PCCLIEngine", "AuthorityModel", "VisualStressEngine"]

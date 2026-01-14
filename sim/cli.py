@@ -33,6 +33,9 @@ class CLIContext:
     current_router: Optional[str] = None
     current_acl: Optional[str] = None
     current_vlan: Optional[int] = None
+    current_class_map: Optional[str] = None
+    current_policy_map: Optional[str] = None
+    current_policy_class: Optional[str] = None
 
     def hostname(self) -> str:
         return self.uid
@@ -49,8 +52,33 @@ class CLIContext:
             return f"{hn}(config-router)# "
         if self.mode == "config-acl":
             return f"{hn}(config-ext-nacl)# "
+            "copy",
+            "write",
+            "reload",
+            "clear",
+            "hostname",
+            "description",
+            "bandwidth",
+            "duplex",
+            "speed",
+            "ip",
+            "logging",
+            "clock",
+            "banner",
+            "enable",
+            "username",
+            "line",
+            "spanning-tree",
+            "channel-group",
+            "ip",
         if self.mode == "config-vlan":
             return f"{hn}(config-vlan)# "
+        if self.mode == "config-cmap":
+            return f"{hn}(config-cmap)# "
+        if self.mode == "config-pmap":
+            return f"{hn}(config-pmap)# "
+        if self.mode == "config-pclass":
+            return f"{hn}(config-pmap-c)# "
         return f"{hn}> "
 
 
@@ -215,6 +243,11 @@ class CLIEngine:
         # Normalize multi-token abbreviations that must happen BEFORE scope gating.
         argv = self._normalize_no_argv(ctx, argv)
         argv = self._normalize_interface_argv(ctx, argv)
+        argv = self._normalize_qos_argv(ctx, argv)
+
+        # ACL shortcut: allow "acc" / "access-list" to behave like "ip access-list".
+        if argv and argv[0].lower() in ("acc", "access-list"):
+            argv = ["ip", "access-list"] + argv[1:]
 
         # Normalize common abbreviations in-place for later matching.
         if argv[0] == "configure":
@@ -229,6 +262,45 @@ class CLIEngine:
         if argv[0] == "conf":
             argv[0] = "configure"
         return argv
+
+    def _normalize_qos_argv(self, ctx: Optional[CLIContext], argv: List[str]) -> List[str]:
+        if not argv:
+            return argv
+
+        out = list(argv)
+
+        # service-policy
+        if out[0].lower().startswith("serv"):
+            out[0] = "service-policy"
+        if out[0].lower() == "service-policy" and len(out) >= 2:
+            out[1] = self._expand_unique_prefix(out[1], ["input", "output"])
+
+        # class-map / policy-map shortcuts
+        if out[0].lower().startswith("class-"):
+            out[0] = "class-map"
+        if out[0].lower() == "class" and (ctx is None or ctx.mode.startswith("config")):
+            out[0] = "class"
+        if out[0].lower().startswith("policy-"):
+            out[0] = "policy-map"
+        if out[0].lower() == "policy" and (ctx is None or ctx.mode.startswith("config")):
+            out[0] = "policy-map"
+
+        # match subcommands
+        if out[0].lower() == "match" and len(out) >= 2:
+            out[1] = self._expand_unique_prefix(out[1], ["dscp", "access-group"])
+
+        # bandwidth / priority
+        if out[0].lower() in ("bw", "bandwidth"):
+            out[0] = "bandwidth"
+            if len(out) >= 2:
+                out[1] = self._expand_unique_prefix(out[1], ["remaining", "percent"])
+            if len(out) >= 3 and out[1] == "remaining":
+                out[2] = self._expand_unique_prefix(out[2], ["percent"])
+
+        if out[0].lower() in ("pri", "priority"):
+            out[0] = "priority"
+
+        return out
 
     def _normalize_no_argv(self, ctx: Optional[CLIContext], argv: List[str]) -> List[str]:
         if not argv or argv[0].lower() != "no" or len(argv) < 2:
@@ -327,6 +399,7 @@ class CLIEngine:
         # 1st arg: show <something>
         show_targets = [
             "running-config",
+            "startup-config",
             "run",
             "ip",
             "vlan",
@@ -335,6 +408,12 @@ class CLIEngine:
             "spanning-tree",
             "etherchannel",
             "access-lists",
+            "class-map",
+            "policy-map",
+            "version",
+            "arp",
+            "cdp",
+            "lldp",
         ]
         argv[1] = self._expand_unique_prefix(argv[1], show_targets)
 
@@ -360,30 +439,45 @@ class CLIEngine:
             argv[2] = self._expand_unique_prefix(argv[2], ["trunk"])
 
         # show mac address-table
-        if argv[1] == "mac" and len(argv) >= 3:
-            argv[2] = self._expand_unique_prefix(argv[2], ["address-table"])
-
-        # show etherchannel summary
         if argv[1] == "etherchannel" and len(argv) >= 3:
             argv[2] = self._expand_unique_prefix(argv[2], ["summary"])
+
+        if argv[1] in ("cdp", "lldp") and len(argv) >= 3:
+            argv[2] = self._expand_unique_prefix(argv[2], ["neighbors"])
+
+        if argv[1] == "policy-map" and len(argv) >= 3:
+            argv[2] = self._expand_unique_prefix(argv[2], ["interface"])
+            if argv[2] == "interface" and len(argv) >= 4:
+                argv[3] = argv[3]
+
+        if argv[1] == "class-map" and len(argv) >= 2:
+            return argv
+
+        if argv[1] == "ip" and len(argv) >= 3:
+            ip_targets = ["interface", "route", "ospf", "protocols", "nat"]
+            argv[2] = self._expand_unique_prefix(argv[2], ip_targets)
+            if argv[2] == "interface" and len(argv) >= 4:
+                argv[3] = self._expand_unique_prefix(argv[3], ["brief"])
+            if argv[2] == "ospf" and len(argv) >= 4:
+                argv[3] = self._expand_unique_prefix(argv[3], ["neighbor"])
+            if argv[2] == "nat" and len(argv) >= 4:
+                argv[3] = self._expand_unique_prefix(argv[3], ["translations", "statistics"])
+
+        if argv[1] == "vlan" and len(argv) >= 3:
+            argv[2] = self._expand_unique_prefix(argv[2], ["brief"])
+
+        if argv[1] == "interfaces" and len(argv) >= 3:
+            argv[2] = self._expand_unique_prefix(argv[2], ["trunk"])
+
+        if argv[1] == "mac" and len(argv) >= 3:
+            argv[2] = self._expand_unique_prefix(argv[2], ["address-table"])
 
         return argv
 
     def _is_supported_command(self, ctx: CLIContext, argv: List[str]) -> bool:
-        """Hard governance: only allow commands we explicitly simulate.
-
-        If an AuthorityModel is provided, it is the source of truth (PDF-driven).
-        Otherwise, fall back to the built-in allowlist.
-        """
-
-        if not argv:
-            return True
-
-        if self.authority is not None:
-            return self.authority.is_command_in_scope(argv)
-
-        # Fallback allowlist (legacy behavior).
         cmd = argv[0].lower()
+        if self.authority and not self.authority.is_command_in_scope(argv):
+            return False
         top = {
             "enable",
             "disable",
@@ -408,27 +502,28 @@ class CLIEngine:
             "deny",
             "name",
             "do",
+            "class-map",
+            "policy-map",
+            "service-policy",
+            "priority",
+            "bandwidth",
+            "match",
+            "match-any",
+            "match-all",
+            "class",
+            "hostname",
+            "logging",
+            "banner",
+            "enable",
+            "username",
+            "clock",
+            "line",
+            "access-list",
         }
         if cmd not in top:
             return False
         if cmd == "show":
-            if len(argv) >= 2 and argv[1] in ("run", "running-config", "access-lists", "spanning-tree"):
-                return True
-            if len(argv) >= 3 and argv[1:3] in (
-                ["ip", "route"],
-                ["ip", "protocols"],
-                ["vlan", "brief"],
-                ["interfaces", "trunk"],
-                ["mac", "address-table"],
-                ["etherchannel", "summary"],
-            ):
-                return True
-            if len(argv) >= 4 and argv[1:4] in (
-                ["ip", "interface", "brief"],
-                ["ip", "ospf", "neighbor"],
-            ):
-                return True
-            return False
+            return True
         return True
 
     def _help(self, ctx: CLIContext, prefix: str) -> str:
@@ -457,6 +552,10 @@ class CLIEngine:
             "show spanning-tree",
             "show etherchannel summary",
             "show access-lists",
+            "access-list extended <name>",
+            "show class-map",
+            "show policy-map",
+            "show policy-map interface <if>",
             "ping <ip>",
             "traceroute <ip>",
         ]
@@ -464,16 +563,36 @@ class CLIEngine:
             base.extend([
                 "interface <name>",
                 "router ospf <id>",
+                "hostname <name>",
+                "ip routing|no ip routing",
+                "logging <host>",
+                "banner motd <text>",
+                "enable secret <pw>",
+                "username <user> secret <pw>",
+                "clock set <timestamp>",
+                "line <vty>",
                 "ip access-list extended <name>",
+                "access-list <num|name> permit|deny ...",
                 "ip route <prefix> <mask> <next-hop>",
+                "ip nat pool <name> <start> <end> netmask <mask>",
+                "ip nat inside source list <acl> interface <if> overload",
+                "ip nat inside source static <local> <global>",
                 "vlan <id>",
                 "encapsulation dot1q <vlan>",
+                "class-map <name>",
+                "policy-map <name>",
                 "do <exec-command>",
                 "end",
             ])
         if ctx.mode == "config-if":
             base.extend([
+                "description <text>",
+                "bandwidth <kbps>",
+                "duplex auto|full|half",
+                "speed auto|10|100|1000",
                 "ip address <ip> <mask>",
+                "ip helper-address <ip>",
+                "ip nat inside|outside",
                 "shutdown",
                 "no shutdown",
                 "switchport mode access|trunk",
@@ -483,6 +602,9 @@ class CLIEngine:
                 "no channel-group",
                 "ip access-group <name> in|out",
                 "no ip access-group in|out",
+                "service-policy input <name>",
+                "service-policy output <name>",
+                "no ip nat inside|outside",
             ])
         if ctx.mode == "config-router":
             base.extend([
@@ -496,20 +618,34 @@ class CLIEngine:
                 "permit ip any any",
                 "deny ip any any",
             ])
-        return sorted(set(base))
+        if ctx.mode == "config-cmap":
+            base.extend([
+                "match dscp <value>",
+                "match access-group <name>",
+                "match-any",
+                "match-all",
+            ])
+        if ctx.mode in ("config-pmap", "config-pclass"):
+            base.extend([
+                "class <name>",
+                "priority <kbps>",
+                "bandwidth <kbps>",
+            ])
+        return base
 
     def _dispatch(self, ctx: CLIContext, cmd: str, argv: List[str], raw: str) -> str:
-        # EXEC / PRIV EXEC
-        if cmd in ("enable", "en"):
+        cmd = cmd.lower()
+
+        if cmd == "enable":
+            if ctx.mode != "exec":
+                raise CLIError("% Invalid input detected at '^' marker.")
             ctx.privileged = True
             return ""
+
         if cmd == "disable":
+            if ctx.mode != "exec":
+                raise CLIError("% Invalid input detected at '^' marker.")
             ctx.privileged = False
-            ctx.mode = "exec"
-            ctx.current_if = None
-            ctx.current_router = None
-            ctx.current_acl = None
-            ctx.current_vlan = None
             return ""
 
         if cmd in ("configure",):
@@ -531,11 +667,18 @@ class CLIEngine:
             ctx.current_router = None
             ctx.current_acl = None
             ctx.current_vlan = None
+            ctx.current_class_map = None
+            ctx.current_policy_map = None
+            ctx.current_policy_class = None
             return ""
 
         if cmd == "exit":
             if ctx.mode == "exec":
                 return "__CLOSE__"  # UI handles closing
+            if ctx.mode == "config-pclass":
+                ctx.mode = "config-pmap"
+                ctx.current_policy_class = None
+                return ""
             if ctx.mode == "config":
                 ctx.mode = "exec"
             else:
@@ -544,6 +687,11 @@ class CLIEngine:
             ctx.current_router = None if ctx.mode != "config-router" else ctx.current_router
             ctx.current_acl = None if ctx.mode != "config-acl" else ctx.current_acl
             ctx.current_vlan = None if ctx.mode != "config-vlan" else ctx.current_vlan
+            ctx.current_class_map = None if ctx.mode != "config-cmap" else ctx.current_class_map
+            if ctx.mode != "config-pmap":
+                ctx.current_policy_map = None
+            if ctx.mode != "config-pclass":
+                ctx.current_policy_class = None
             return ""
 
         if cmd == "show":
@@ -556,7 +704,6 @@ class CLIEngine:
                 raise CLIError("% Invalid input detected at '^' marker.")
             if len(argv) < 2:
                 raise CLIError("% Usage: ping <ip>")
-            # Be tolerant of extra tokens (some users type a netmask or other args).
             lines = ctx.sim.ping(ctx.uid, argv[1])
             return "\n".join(lines)
 
@@ -568,7 +715,25 @@ class CLIEngine:
             lines = ctx.sim.traceroute(ctx.uid, argv[1])
             return "\n".join(lines)
 
-        # CONFIG modes
+        if cmd == "copy" and len(argv) >= 3:
+            src, dst = argv[1], argv[2]
+            if src.startswith("running") and dst.startswith("startup"):
+                return "[OK]"
+            raise CLIError("% Invalid input detected at '^' marker.")
+
+        if cmd == "write":
+            return "[OK]"
+
+        if cmd == "reload":
+            return "System will reload (simulated)"
+
+        if cmd == "clear":
+            if len(argv) >= 2 and argv[1] == "counters":
+                return "Clear counters on all interfaces\n[OK]"
+            if len(argv) >= 4 and argv[1:4] == ["ip", "route", "*"]:
+                return "[OK]"
+            raise CLIError("% Invalid input detected at '^' marker.")
+
         if ctx.mode.startswith("config"):
             if cmd == "interface":
                 if len(argv) != 2:
@@ -580,6 +745,52 @@ class CLIEngine:
                 ctx.current_router = None
                 ctx.current_acl = None
                 ctx.sim.recompute()
+                return ""
+
+            if cmd == "hostname" and len(argv) == 2:
+                dev = ctx.sim.devices[ctx.uid]
+                dev.hostname = argv[1]
+                return ""
+
+            if cmd == "ip" and len(argv) >= 2 and argv[1] == "routing":
+                dev = ctx.sim.devices[ctx.uid]
+                dev.ip_routing = True
+                return ""
+            if cmd == "no" and len(argv) >= 3 and argv[1] == "ip" and argv[2] == "routing":
+                dev = ctx.sim.devices[ctx.uid]
+                dev.ip_routing = False
+                return ""
+
+            if cmd == "logging" and len(argv) == 2:
+                dev = ctx.sim.devices[ctx.uid]
+                dev.logging_host = argv[1]
+                return ""
+
+            if cmd == "banner" and len(argv) >= 3 and argv[1].lower() == "motd":
+                dev = ctx.sim.devices[ctx.uid]
+                dev.banner_motd = " ".join(argv[2:])
+                return ""
+
+            if cmd == "enable" and len(argv) >= 3 and argv[1].lower() == "secret":
+                dev = ctx.sim.devices[ctx.uid]
+                dev.enable_secret = argv[2]
+                return ""
+
+            if cmd == "username" and len(argv) >= 3:
+                dev = ctx.sim.devices[ctx.uid]
+                user = argv[1]
+                if argv[2].lower() == "secret" and len(argv) >= 4:
+                    dev.usernames[user] = argv[3]
+                else:
+                    dev.usernames[user] = argv[2]
+                return ""
+
+            if cmd == "clock" and len(argv) >= 2 and argv[1].lower() == "set":
+                dev = ctx.sim.devices[ctx.uid]
+                dev.clock = " ".join(argv[2:])
+                return ""
+
+            if cmd == "line" and len(argv) >= 2:
                 return ""
 
             if cmd == "vlan":
@@ -623,8 +834,29 @@ class CLIEngine:
                 ctx.sim.recompute()
                 return ""
 
-            if cmd == "ip" and len(argv) >= 4 and argv[1].lower() == "access-list" and argv[2].lower() == "extended":
-                name = argv[3]
+            if cmd == "access-list" and len(argv) >= 6:
+                name = argv[1]
+                action = argv[2].lower()
+                proto = argv[3].lower()
+                src = argv[4]
+                dst = " ".join(argv[5:])
+                if action not in ("permit", "deny"):
+                    raise CLIError("% Invalid input detected at '^' marker.")
+                if proto not in ("ip", "icmp"):
+                    raise CLIError("% Invalid input detected at '^' marker.")
+                dev = ctx.sim.devices[ctx.uid]
+                dev.acls.setdefault(name, []).append(ACLRule(action=action, protocol=proto, src=src, dst=dst))
+                ctx.sim.recompute()
+                return ""
+
+            if cmd == "ip" and len(argv) >= 3 and argv[1].lower() == "access-list":
+                if len(argv) >= 4 and argv[2].lower() == "extended":
+                    name_idx = 3
+                else:
+                    name_idx = 2
+                if len(argv) <= name_idx:
+                    raise CLIError("% Incomplete command.")
+                name = argv[name_idx]
                 dev = ctx.sim.devices[ctx.uid]
                 dev.acls.setdefault(name, [])
                 ctx.mode = "config-acl"
@@ -634,8 +866,80 @@ class CLIEngine:
                 ctx.sim.recompute()
                 return ""
 
+            if cmd == "ip" and len(argv) >= 4 and argv[1:4] == ["nat", "inside", "source"]:
+                dev = ctx.sim.devices[ctx.uid]
+                if len(argv) >= 8 and argv[4].lower() == "list" and argv[6].lower() == "interface":
+                    acl = argv[5]
+                    iface = argv[7] if len(argv) >= 8 else None
+                    overload = len(argv) >= 9 and argv[8].lower() == "overload"
+                    if iface is None:
+                        raise CLIError("% Incomplete command.")
+                    dev.nat_inside_source_list.append((acl, iface, overload))
+                    ctx.sim.recompute()
+                    return ""
+                if len(argv) >= 6 and argv[4].lower() == "static":
+                    local = argv[5]
+                    glob = argv[6] if len(argv) >= 7 else None
+                    if glob is None:
+                        raise CLIError("% Incomplete command.")
+                    dev.nat_inside_static.append((local, glob))
+                    ctx.sim.recompute()
+                    return ""
+                raise CLIError("% Invalid input detected at '^' marker.")
+
+            if cmd == "ip" and len(argv) >= 7 and argv[1:3] == ["nat", "pool"]:
+                name = argv[2]
+                start = argv[3]
+                end = argv[4]
+                if len(argv) < 6 or argv[5].lower() != "netmask" or len(argv) < 7:
+                    raise CLIError("% Incomplete command.")
+                mask = argv[6]
+                dev = ctx.sim.devices[ctx.uid]
+                dev.nat_pools[name] = (start, end, mask)
+                ctx.sim.recompute()
+                return ""
+
+            if ctx.mode == "config" and cmd in ("class-map", "class"):
+                if len(argv) < 2:
+                    raise CLIError("% Incomplete command.")
+                name_idx = 1
+                match_mode = None
+                if len(argv) >= 3 and argv[1].lower() in ("match-any", "match-all"):
+                    match_mode = argv[1].lower().split("-")[-1]
+                    name_idx = 2
+                name = argv[name_idx]
+                dev = ctx.sim.devices[ctx.uid]
+                entry = dev.class_maps.setdefault(name, {"match": match_mode or "all", "matches": []})
+                if match_mode:
+                    entry["match"] = match_mode
+                ctx.mode = "config-cmap"
+                ctx.current_class_map = name
+                ctx.current_policy_map = None
+                ctx.current_policy_class = None
+                ctx.sim.recompute()
+                return ""
+
+            if ctx.mode == "config" and cmd in ("policy-map", "policy"):
+                if len(argv) < 2:
+                    raise CLIError("% Incomplete command.")
+                name = argv[1]
+                dev = ctx.sim.devices[ctx.uid]
+                dev.policy_maps.setdefault(name, {"classes": {}})
+                ctx.mode = "config-pmap"
+                ctx.current_policy_map = name
+                ctx.current_policy_class = None
+                ctx.current_class_map = None
+                ctx.sim.recompute()
+                return ""
+
         if ctx.mode == "config-if":
             return self._cmd_config_if(ctx, argv)
+
+        if ctx.mode == "config-cmap":
+            return self._cmd_config_cmap(ctx, argv)
+
+        if ctx.mode in ("config-pmap", "config-pclass"):
+            return self._cmd_config_pmap(ctx, argv)
 
         if ctx.mode == "config-router":
             return self._cmd_config_router(ctx, argv)
@@ -652,6 +956,8 @@ class CLIEngine:
         # Accept: show run | show running-config | sh run
         if len(argv) >= 2 and argv[1] in ("run", "running-config"):
             return ctx.sim.show_running_config(ctx.uid)
+        if len(argv) >= 2 and argv[1] == "startup-config":
+            return ctx.sim.show_startup_config(ctx.uid)
         # Accept: show ip interface brief | show ip int brief | show ip int br
         if len(argv) >= 4 and argv[1:4] == ["ip", "interface", "brief"]:
             return ctx.sim.show_ip_interface_brief(ctx.uid)
@@ -661,10 +967,18 @@ class CLIEngine:
             return ctx.sim.show_ospf_neighbor(ctx.uid)
         if len(argv) >= 3 and argv[1:3] == ["ip", "protocols"]:
             return ctx.sim.show_ip_protocols(ctx.uid)
+        if len(argv) >= 4 and argv[1:4] == ["ip", "nat", "translations"]:
+            return ctx.sim.show_ip_nat_translations(ctx.uid)
+        if len(argv) >= 4 and argv[1:4] == ["ip", "nat", "statistics"]:
+            return ctx.sim.show_ip_nat_statistics(ctx.uid)
         if len(argv) >= 3 and argv[1:3] == ["vlan", "brief"]:
             return ctx.sim.show_vlan_brief(ctx.uid)
+        if len(argv) >= 2 and argv[1] == "vlan":
+            return ctx.sim.show_vlan(ctx.uid)
         if len(argv) >= 3 and argv[1:3] == ["interfaces", "trunk"]:
             return ctx.sim.show_interfaces_trunk(ctx.uid)
+        if len(argv) >= 2 and argv[1] == "interfaces":
+            return ctx.sim.show_interfaces(ctx.uid)
         if len(argv) >= 3 and argv[1:3] == ["mac", "address-table"]:
             return ctx.sim.show_mac_address_table(ctx.uid)
         if len(argv) >= 2 and argv[1] == "spanning-tree":
@@ -673,6 +987,76 @@ class CLIEngine:
             return ctx.sim.show_etherchannel_summary(ctx.uid)
         if len(argv) >= 2 and argv[1] == "access-lists":
             return ctx.sim.show_access_lists(ctx.uid)
+        if len(argv) >= 2 and argv[1] == "version":
+            return ctx.sim.show_version(ctx.uid)
+        if len(argv) >= 2 and argv[1] == "arp":
+            return ctx.sim.show_arp(ctx.uid)
+        if len(argv) >= 3 and argv[1:3] == ["cdp", "neighbors"]:
+            return ctx.sim.show_cdp_neighbors(ctx.uid)
+        if len(argv) >= 3 and argv[1:3] == ["lldp", "neighbors"]:
+            return ctx.sim.show_lldp_neighbors(ctx.uid)
+        if len(argv) >= 2 and argv[1] == "class-map":
+            return ctx.sim.show_class_map(ctx.uid)
+        if len(argv) >= 2 and argv[1] == "policy-map":
+            if len(argv) >= 3 and argv[2] == "interface":
+                if len(argv) >= 4:
+                    return ctx.sim.show_policy_map_interface(ctx.uid, argv[3])
+                return ctx.sim.show_policy_map_interface(ctx.uid)
+            return ctx.sim.show_policy_map(ctx.uid)
+        raise CLIError("% Invalid input detected at '^' marker.")
+
+    def _cmd_config_cmap(self, ctx: CLIContext, argv: List[str]) -> str:
+        if not ctx.current_class_map:
+            raise CLIError("% Invalid input detected at '^' marker.")
+        dev = ctx.sim.devices[ctx.uid]
+        entry = dev.class_maps.setdefault(ctx.current_class_map, {"match": "all", "matches": []})
+        cmd = argv[0].lower()
+
+        if cmd in ("match-any", "match-all"):
+            entry["match"] = "any" if "any" in cmd else "all"
+            return ""
+
+        if cmd == "match" and len(argv) >= 2:
+            clause = " ".join(argv[1:])
+            entry.setdefault("matches", []).append(clause)
+            return ""
+
+        raise CLIError("% Invalid input detected at '^' marker.")
+
+    def _cmd_config_pmap(self, ctx: CLIContext, argv: List[str]) -> str:
+        if not ctx.current_policy_map:
+            raise CLIError("% Invalid input detected at '^' marker.")
+
+        dev = ctx.sim.devices[ctx.uid]
+        pmap = dev.policy_maps.setdefault(ctx.current_policy_map, {"classes": {}})
+        cmd = argv[0].lower()
+
+        if ctx.mode == "config-pmap" and cmd == "class":
+            if len(argv) < 2:
+                raise CLIError("% Incomplete command.")
+            cls = argv[1]
+            pmap.setdefault("classes", {}).setdefault(cls, [])
+            ctx.current_policy_class = cls
+            ctx.mode = "config-pclass"
+            return ""
+
+        if ctx.mode == "config-pclass":
+            cls = ctx.current_policy_class or "class-default"
+            actions = pmap.setdefault("classes", {}).setdefault(cls, [])
+
+            if cmd == "priority":
+                if len(argv) < 2:
+                    raise CLIError("% Incomplete command.")
+                actions.append(f"priority {argv[1]}")
+                return ""
+
+            if cmd == "bandwidth":
+                if len(argv) < 3:
+                    raise CLIError("% Incomplete command.")
+                action = "bandwidth " + " ".join(argv[1:])
+                actions.append(action)
+                return ""
+
         raise CLIError("% Invalid input detected at '^' marker.")
 
     def _cmd_config_if(self, ctx: CLIContext, argv: List[str]) -> str:
@@ -682,9 +1066,50 @@ class CLIEngine:
         itf = dev.interfaces[ctx.current_if]
 
         cmd = argv[0].lower()
+        if cmd == "description" and len(argv) >= 2:
+            itf.description = " ".join(argv[1:])
+            ctx.sim.recompute()
+            return ""
+
+        if cmd == "bandwidth" and len(argv) >= 2:
+            try:
+                itf.bandwidth_kbps = int(argv[1])
+            except Exception:
+                raise CLIError("% Invalid input detected at '^' marker.")
+            ctx.sim.recompute()
+            return ""
+
+        if cmd == "duplex" and len(argv) >= 2:
+            itf.duplex = argv[1].lower()
+            ctx.sim.recompute()
+            return ""
+
+        if cmd == "speed" and len(argv) >= 2:
+            itf.speed = argv[1].lower()
+            ctx.sim.recompute()
+            return ""
+
         if cmd == "ip" and len(argv) == 4 and argv[1].lower() == "address":
             itf.ip = argv[2]
             itf.mask = argv[3]
+            ctx.sim.recompute()
+            return ""
+
+        if cmd == "ip" and len(argv) >= 3 and argv[1].lower() == "helper-address":
+            itf.helper_addresses.append(argv[2])
+            ctx.sim.recompute()
+            return ""
+
+        if cmd == "ip" and len(argv) >= 3 and argv[1].lower() == "nat":
+            direction = argv[2].lower()
+            if direction == "inside":
+                itf.nat_inside = True
+                itf.nat_outside = False
+            elif direction == "outside":
+                itf.nat_outside = True
+                itf.nat_inside = False
+            else:
+                raise CLIError("% Invalid input detected at '^' marker.")
             ctx.sim.recompute()
             return ""
 
@@ -770,6 +1195,29 @@ class CLIEngine:
             ctx.sim.recompute()
             return ""
 
+        if cmd == "service-policy" and len(argv) >= 3:
+            direction = argv[1].lower()
+            pol = argv[2]
+            if direction == "input":
+                itf.service_policy_in = pol
+            elif direction == "output":
+                itf.service_policy_out = pol
+            else:
+                raise CLIError("% Invalid input detected at '^' marker.")
+            ctx.sim.recompute()
+            return ""
+
+        if cmd == "no" and len(argv) == 3 and argv[1].lower() == "service-policy":
+            direction = argv[2].lower()
+            if direction == "input":
+                itf.service_policy_in = None
+            elif direction == "output":
+                itf.service_policy_out = None
+            else:
+                raise CLIError("% Invalid input detected at '^' marker.")
+            ctx.sim.recompute()
+            return ""
+
         if cmd == "no" and len(argv) == 2 and argv[1].lower() == "channel-group":
             itf.channel_group = None
             itf.channel_mode = None
@@ -801,6 +1249,29 @@ class CLIEngine:
                 itf.acl_out = None
             else:
                 raise CLIError("% Invalid input detected at '^' marker.")
+            ctx.sim.recompute()
+            return ""
+
+        if cmd == "no" and len(argv) >= 4 and argv[1].lower() == "ip" and argv[2].lower() == "nat":
+            direction = argv[3].lower() if len(argv) >= 4 else ""
+            if direction == "inside":
+                itf.nat_inside = False
+            elif direction == "outside":
+                itf.nat_outside = False
+            else:
+                raise CLIError("% Invalid input detected at '^' marker.")
+            ctx.sim.recompute()
+            return ""
+
+        if cmd == "no" and len(argv) >= 3 and argv[1].lower() == "ip" and argv[2].lower() == "helper-address":
+            # Remove a helper if specified, otherwise clear all.
+            if len(argv) >= 4:
+                try:
+                    itf.helper_addresses.remove(argv[3])
+                except ValueError:
+                    pass
+            else:
+                itf.helper_addresses = []
             ctx.sim.recompute()
             return ""
 
@@ -857,23 +1328,19 @@ class CLIEngine:
             raise CLIError("% Invalid input detected at '^' marker.")
         name = ctx.current_acl
 
-        if len(argv) != 4:
+        if len(argv) < 4:
             raise CLIError("% Invalid input detected at '^' marker.")
 
         action = argv[0].lower()
         proto = argv[1].lower()
-        src = argv[2].lower()
-        dst = argv[3].lower()
+        src = argv[2]
+        dst = " ".join(argv[3:])
 
         if action not in ("permit", "deny"):
             raise CLIError("% Invalid input detected at '^' marker.")
         if proto not in ("ip", "icmp"):
             raise CLIError("% Invalid input detected at '^' marker.")
-        if src != "any":
-            raise CLIError("% Only 'any' supported in this build")
-        if dst != "any":
-            raise CLIError("% Only 'any' supported in this build")
 
-        dev.acls.setdefault(name, []).append(ACLRule(action=action, protocol=proto, src="any", dst="any"))
+        dev.acls.setdefault(name, []).append(ACLRule(action=action, protocol=proto, src=src, dst=dst))
         ctx.sim.recompute()
         return ""

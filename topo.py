@@ -12,7 +12,9 @@ except Exception:
     AgentPanel = None
 
 from sim import TopologySim, CLIEngine, PCCLIEngine, AuthorityModel
+from sim.core import HARDWARE_PROFILES
 from sim.authority import default_pdf_paths
+from sim.visual_stress import VisualStressEngine
 
 NODE_RADIUS = 18
 DRAG_THRESHOLD = 5
@@ -45,6 +47,46 @@ class TopologyTool:
 
         self.panes.add(self.left, stretch="always")
         self.panes.add(self.right, minsize=320)
+
+        # Simple top toolbar for quick actions
+        self.toolbar = tk.Frame(self.left, bg="#0f1115")
+        self.toolbar.pack(fill=tk.X, side=tk.TOP)
+
+        self.traffic_btn = tk.Button(
+            self.toolbar,
+            text="Run Traffic (Ctrl+T)",
+            command=self.simulate_traffic,
+            bg="#1f222a",
+            fg="#e0e0e0",
+            activebackground="#2b2f38",
+            activeforeground="#ffffff",
+            relief=tk.FLAT,
+            padx=8,
+            pady=4,
+        )
+        self.traffic_btn.pack(side=tk.LEFT, padx=8, pady=6)
+
+        self.ping_status = tk.Label(
+            self.toolbar,
+            text="Ping: idle",
+            fg="#9e9e9e",
+            bg="#0f1115",
+            padx=6,
+        )
+        self.ping_status.pack(side=tk.LEFT, padx=(4, 10))
+
+        # Hardware profile selectors (data-driven)
+        self.router_profile_var = tk.StringVar(value="MODERN_ROUTER")
+        self.switch_profile_var = tk.StringVar(value="MODERN_ACCESS_SWITCH")
+
+        router_profiles = [p for p in sorted(HARDWARE_PROFILES.keys()) if "ROUTER" in p]
+        switch_profiles = [p for p in sorted(HARDWARE_PROFILES.keys()) if "SWITCH" in p]
+
+        tk.Label(self.toolbar, text="Router HW:", fg="#cccccc", bg="#0f1115").pack(side=tk.LEFT, padx=(4, 2))
+        tk.OptionMenu(self.toolbar, self.router_profile_var, *router_profiles).pack(side=tk.LEFT, padx=(0, 8))
+
+        tk.Label(self.toolbar, text="Switch HW:", fg="#cccccc", bg="#0f1115").pack(side=tk.LEFT, padx=(4, 2))
+        tk.OptionMenu(self.toolbar, self.switch_profile_var, *switch_profiles).pack(side=tk.LEFT, padx=(0, 8))
 
         self.canvas = tk.Canvas(self.left, bg="#0f1115", width=1200, height=800, highlightthickness=0)
         self.canvas.pack(fill=tk.BOTH, expand=True)
@@ -90,6 +132,11 @@ class TopologyTool:
 
         # Simulator + CLI
         self.sim = TopologySim()
+        self.sim_tick_job: Optional[str] = None
+        self.ping_probe_job: Optional[str] = None
+
+        # Visual stress engine: slow, perceptually-aware color evolution
+        self.visual_engine = VisualStressEngine(enable_logging=True)
 
         # In-memory session log (saveable for debugging)
         self.session = SessionLogger()
@@ -202,6 +249,26 @@ class TopologyTool:
             self.session.add(kind, **data)
         except Exception:
             pass
+
+    def show_visual_stress_debug(self):
+        """Print visual stress evolution logs to console (Ctrl+D)."""
+        logs = self.visual_engine.format_logs(last_n=30)
+        print("\n" + logs + "\n")
+        # Also show current state for all entities
+        print("Current Visual State:")
+        print("-" * 50)
+        for node_id, meta in self.nodes.items():
+            uid = self.node_uid.get(node_id)
+            if not uid:
+                continue
+            entity_id = f"device:{uid}"
+            info = self.visual_engine.get_debug_info(entity_id)
+            if info:
+                print(f"  {uid}: vis_stress={info['visual']['visible_stress']:.3f} "
+                      f"stress={info['stress']['stress_norm']:.3f} "
+                      f"util={info['load']['utilization']:.1%} "
+                      f"color={info['visual']['current_color']}")
+        print()
 
     def _normalize_ios_provision_commands(self, cmds: List[str]) -> List[str]:
         # Goal: keep IOS realism (interfaces default down) while making agent-provided
@@ -357,21 +424,34 @@ class TopologyTool:
         sessionmenu = tk.Menu(menubar, tearoff=0)
         sessionmenu.add_command(label="Save Session Log…", command=self.save_session_log)
         sessionmenu.add_command(label="Clear Session Log", command=self.clear_session_log)
+        sessionmenu.add_separator()
+        sessionmenu.add_command(label="Simulate Traffic", command=self.simulate_traffic, accelerator="Ctrl+T")
         menubar.add_cascade(label="Session", menu=sessionmenu)
 
         self.root.config(menu=menubar)
 
     def save_session_log(self):
-        path = filedialog.asksaveasfilename(
-            title="Save session log",
-            defaultextension=".session.json",
-            filetypes=[("Session Log JSON", "*.session.json"), ("JSON", "*.json"), ("All files", "*.*")],
-        )
-        if not path:
-            return
+        # Save to the workspace root; remove previous session logs so the newest one replaces them.
+        import os
+        import glob
+        from datetime import datetime
+
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+
+        # Clean up existing session logs to effectively overwrite the previous one.
+        try:
+            for old in glob.glob(os.path.join(base_dir, "session_log_*.session.json")):
+                try:
+                    os.remove(old)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+        path = os.path.join(base_dir, f"session_log_{ts}.session.json")
         try:
             self.session.save_json(path)
-            messagebox.showinfo("Session log", f"Saved session log to:\n{path}")
         except Exception as e:
             messagebox.showerror("Session log", str(e))
 
@@ -381,6 +461,264 @@ class TopologyTool:
             self.session.add("session_cleared")
         except Exception:
             pass
+
+    def _blend_color(self, c1: str, c2: str, t: float) -> str:
+        t = max(0.0, min(1.0, t))
+        c1 = c1.lstrip("#")
+        c2 = c2.lstrip("#")
+        r1, g1, b1 = int(c1[0:2], 16), int(c1[2:4], 16), int(c1[4:6], 16)
+        r2, g2, b2 = int(c2[0:2], 16), int(c2[2:4], 16), int(c2[4:6], 16)
+        r = int(r1 + (r2 - r1) * t)
+        g = int(g1 + (g2 - g1) * t)
+        b = int(b1 + (b2 - b1) * t)
+        return f"#{r:02x}{g:02x}{b:02x}"
+
+    def _color_for_stress(self, stress: float) -> str:
+        # green -> yellow -> orange -> red
+        stress = max(0.0, min(1.0, stress))
+        if stress < 0.33:
+            return self._blend_color("#4caf50", "#cddc39", stress / 0.33)
+        if stress < 0.66:
+            return self._blend_color("#cddc39", "#ff9800", (stress - 0.33) / 0.33)
+        return self._blend_color("#ff9800", "#f44336", (stress - 0.66) / 0.34)
+
+    def _color_for_util(self, util: float) -> str:
+        util = max(0.0, util)
+        if util < 0.5:
+            return self._blend_color("#b0bec5", "#8bc34a", util / 0.5)
+        if util < 1.0:
+            return self._blend_color("#8bc34a", "#ffc107", (util - 0.5) / 0.5)
+        return self._blend_color("#ffc107", "#f44336", min(1.0, util - 1.0))
+
+    def _run_sim_tick(self):
+        try:
+            self.sim.tick()
+        except Exception:
+            self.sim_tick_job = None
+            return
+
+        # Feed simulation state into the visual stress engine
+        self._sync_visual_engine()
+
+        # Evolve visual state (slow, perceptual transitions)
+        self.visual_engine.tick(self.sim.tick_interval_sec)
+
+        # Render colors based on evolved visual state
+        self.update_stress_visuals()
+
+        # Kick ping probe to reflect current conditions.
+        self._ensure_ping_probe()
+
+        keep_running = self.sim.traffic_active
+        if not keep_running:
+            for l in self.sim.link_load.values():
+                if l.get("utilization", 0.0) > 0.01 or l.get("load_mbps", 0.0) > 0.01:
+                    keep_running = True
+                    break
+        if not keep_running:
+            for d in self.sim.device_load.values():
+                if d.get("stress_level", 0.0) > 0.01 or d.get("throughput_mbps", 0.0) > 0.01:
+                    keep_running = True
+                    break
+
+        if keep_running:
+            self.sim_tick_job = self.root.after(int(self.sim.tick_interval_sec * 1000), self._run_sim_tick)
+        else:
+            self.sim_tick_job = None
+
+    def _ensure_sim_loop(self):
+        if self.sim_tick_job is None:
+            self.sim_tick_job = self.root.after(int(self.sim.tick_interval_sec * 1000), self._run_sim_tick)
+
+    def _cancel_sim_loop(self):
+        if self.sim_tick_job is not None:
+            try:
+                self.root.after_cancel(self.sim_tick_job)
+            except Exception:
+                pass
+            self.sim_tick_job = None
+
+    def _run_ping_probe(self):
+        hosts = []
+        for node_canvas_id, meta in self.nodes.items():
+            if meta.get("type") != "host":
+                continue
+            uid = self.node_uid.get(node_canvas_id)
+            if not uid:
+                continue
+            dev = self.sim.devices.get(uid)
+            if not dev:
+                continue
+            ip_itf = next((itf for itf in dev.interfaces.values() if itf.ip), None)
+            if ip_itf:
+                hosts.append((uid, ip_itf.ip))
+
+        if len(hosts) < 2:
+            self.ping_status.config(text="Ping: idle", fg="#9e9e9e")
+            self.ping_probe_job = None
+            return
+
+        src_uid, _ = hosts[0]
+        _dst_uid, dst_ip = hosts[1]
+        res = self.sim.ping(src_uid, dst_ip)
+        summary = " ".join(res)
+        color = "#8bc34a"
+        if "Success rate is" in summary:
+            try:
+                rate_part = summary.split("Success rate is")[1].split("percent")[0].strip()
+                pct = int(rate_part)
+                if pct < 100:
+                    color = "#ffc107"
+                if pct < 70:
+                    color = "#f44336"
+            except Exception:
+                pass
+        self.ping_status.config(text=f"Ping {src_uid}->{dst_ip}: {summary}", fg=color)
+
+        # Reschedule
+        self.ping_probe_job = self.root.after(1000, self._run_ping_probe)
+
+    def _ensure_ping_probe(self):
+        if self.ping_probe_job is None:
+            self.ping_probe_job = self.root.after(1000, self._run_ping_probe)
+
+    def _cancel_ping_probe(self):
+        if self.ping_probe_job is not None:
+            try:
+                self.root.after_cancel(self.ping_probe_job)
+            except Exception:
+                pass
+            self.ping_probe_job = None
+
+    def simulate_traffic(self):
+        """Toggle continuous all-host traffic with sustained load."""
+        host_uids = []
+        for node_canvas_id, meta in self.nodes.items():
+            if meta.get("type") == "host":
+                uid = self.node_uid.get(node_canvas_id)
+                if uid:
+                    host_uids.append(uid)
+
+        src_hosts = []
+        for uid in host_uids:
+            dev = self.sim.devices.get(uid)
+            if not dev:
+                continue
+            ip_itf = next((itf for itf in dev.interfaces.values() if itf.ip), None)
+            if ip_itf:
+                src_hosts.append((uid, ip_itf.ip))
+
+        if self.sim.traffic_active:
+            self.sim.stop_traffic()
+            self.log_event("simulate_traffic_stop", hosts=len(src_hosts))
+            self.traffic_btn.config(text="Run Traffic (Ctrl+T)")
+            self._ensure_sim_loop()  # allow cooling ticks
+            self._cancel_ping_probe()
+            self.ping_status.config(text="Traffic stopped. Cooling...", fg="#9e9e9e")
+            return
+
+        if len(src_hosts) < 2:
+            messagebox.showwarning("Simulate Traffic", "Need at least two hosts with IP addresses to simulate traffic.")
+            return
+
+        # Start continuous traffic
+        self.sim.start_traffic()
+        flow_count = len(src_hosts) * (len(src_hosts) - 1)
+        self.log_event("simulate_traffic_start", hosts=len(src_hosts), flows=flow_count)
+        self.traffic_btn.config(text="Stop Traffic (Ctrl+T)")
+        self._ensure_sim_loop()
+        self._ensure_ping_probe()
+
+        # Non-blocking indicator that persists while traffic runs
+        self.ping_status.config(text="Traffic running…", fg="#8bc34a")
+
+        sample_lines: List[str] = []
+        if len(src_hosts) >= 2:
+            s_uid, _ = src_hosts[0]
+            _d_uid, d_ip = src_hosts[1]
+            res = self.sim.ping(s_uid, d_ip)
+            self.log_event("simulate_traffic_ping", src=s_uid, dst_ip=d_ip, output=res)
+            sample_lines.append(f"{s_uid} -> {d_ip}: {'; '.join(res)}")
+
+        msg = [f"Traffic running across {len(src_hosts)} hosts ({flow_count} flows)."]
+        msg.append(f"Load ramps over ~{self.sim.ramp_seconds:.0f}s and cools when stopped.")
+        if sample_lines:
+            msg.append("\nSample ping:")
+            msg.extend(sample_lines)
+
+    def _sync_visual_engine(self):
+        """Push current simulation load into the visual stress engine."""
+        # Devices
+        for node_id, meta in self.nodes.items():
+            uid = self.node_uid.get(node_id)
+            if not uid:
+                continue
+            dload = self.sim.device_load.get(uid, {})
+            prof_name = dload.get("profile") or ""
+            prof = HARDWARE_PROFILES.get(prof_name, HARDWARE_PROFILES.get("HOST_OPTIMIZED", {}))
+            capacity = max(1.0, prof.get("max_forwarding_mbps", 1.0))
+            util = dload.get("throughput_mbps", 0.0) / capacity
+            loss = dload.get("drop_prob", 0.0)
+            latency = dload.get("delay_ms", 0.0)
+            # Register and update load for this device
+            self.visual_engine.update_load(
+                entity_id=f"device:{uid}",
+                utilization=util,
+                packet_loss=loss,
+                latency_ms=latency,
+            )
+
+        # Links
+        for edge in self.edges:
+            sims = list(edge.get("sim_links", []) or [])
+            if not sims:
+                continue
+            lid = sims[0].get("id")
+            if not lid:
+                continue
+            lload = self.sim.link_load.get(lid, {})
+            util = lload.get("utilization", 0.0)
+            loss = lload.get("drop_prob", 0.0)
+            # Queue depth only builds when utilization exceeds 80%
+            queue = max(0.0, (util - 0.8) / 0.2) if util > 0.8 else 0.0
+            self.visual_engine.update_load(
+                entity_id=f"link:{lid}",
+                utilization=util,
+                packet_loss=loss,
+                queue_depth=queue,
+            )
+
+    def update_stress_visuals(self):
+        """
+        Render colors using the VisualStressEngine's slowly-evolving visual state.
+        Color is driven ONLY by visible_stress_norm, which changes gradually.
+        """
+        # Devices: color from visual engine
+        for node_id, meta in self.nodes.items():
+            uid = self.node_uid.get(node_id)
+            if not uid:
+                continue
+            entity_id = f"device:{uid}"
+            color = self.visual_engine.get_color(entity_id)
+            self.canvas.itemconfig(node_id, fill=color)
+
+        # Links: color from visual engine
+        for edge in self.edges:
+            sims = list(edge.get("sim_links", []) or [])
+            if not sims:
+                continue
+            lid = sims[0].get("id")
+            if not lid:
+                continue
+            entity_id = f"link:{lid}"
+            color = self.visual_engine.get_color(entity_id)
+            vis_stress = self.visual_engine.get_visible_stress(entity_id)
+            # Width grows slowly with visible stress
+            width = EDGE_WIDTH + min(4, vis_stress * 4)
+            try:
+                self.canvas.itemconfig(edge["line"], fill=color, width=width)
+            except Exception:
+                pass
 
     def new_file(self):
         self.clear_topology()
@@ -419,12 +757,14 @@ class TopologyTool:
             if not uid:
                 continue
             cx, cy = self.get_center(node_canvas_id)
+            hw = self.sim.devices.get(uid).hardware_profile if self.sim.devices.get(uid) else None
             nodes_out.append({
                 "id": uid,
                 "type": meta.get("type", "router"),
                 "x": cx,
                 "y": cy,
                 "seq": meta.get("seq", 0),
+                "hardwareProfile": hw,
             })
 
         nodes_out.sort(key=lambda n: (n.get("type", ""), n.get("seq", 0), n.get("id", "")))
@@ -510,9 +850,10 @@ class TopologyTool:
             ntype = n.get("type", "router")
             x = n.get("x")
             y = n.get("y")
+            hw = n.get("hardwareProfile") or n.get("hardware_profile")
             if not uid or x is None or y is None:
                 continue
-            self._create_node_of_type(str(ntype), float(x), float(y), forced_uid=str(uid))
+            self._create_node_of_type(str(ntype), float(x), float(y), forced_uid=str(uid), hardware_profile=hw)
 
         # Then links
         for e in links:
@@ -698,6 +1039,8 @@ class TopologyTool:
         self.root.bind_all("<Control-s>", lambda e: self.save_file())
         self.root.bind_all("<Control-Shift-s>", lambda e: self.save_file_as())
         self.root.bind_all("<Control-Shift-S>", lambda e: self.save_file_as())
+        self.root.bind_all("<Control-t>", lambda e: self.simulate_traffic())
+        self.root.bind_all("<Control-d>", lambda e: self.show_visual_stress_debug())
 
         # ---- Mouse ----
         self.canvas.bind("<Button-1>", self.on_mouse_down)
@@ -886,8 +1229,7 @@ class TopologyTool:
             return
 
         dst_uid = self.node_uid.get(dst_node_id)
-        if not dst_uid or dst_uid == self.ping_src_uid:
-            self._cancel_ping_mode()
+        if not dst_uid:
             return
 
         dst_ip = self._pick_device_ip(dst_uid)
@@ -1118,9 +1460,21 @@ class TopologyTool:
             kind = "router"
 
         if kind == "host":
-            win = DeviceCLIWindow(self.root, uid, self.pc_cli_engine, banner=f"{uid} PC CLI (lightweight)")
+            win = DeviceCLIWindow(
+                self.root,
+                uid,
+                self.pc_cli_engine,
+                banner=f"{uid} PC CLI (lightweight)",
+                log_cb=self.log_event,
+            )
         else:
-            win = DeviceCLIWindow(self.root, uid, self.cli_engine, banner=f"{uid} IOS-like CLI (lightweight)")
+            win = DeviceCLIWindow(
+                self.root,
+                uid,
+                self.cli_engine,
+                banner=f"{uid} IOS-like CLI (lightweight)",
+                log_cb=self.log_event,
+            )
         self.cli_windows[uid] = win
 
     # ───────────────── Edge context menu ─────────────────
@@ -1296,6 +1650,10 @@ class TopologyTool:
             nodeCount=len(self.nodes),
             edgeCount=len(self.edges),
         )
+        self._cancel_sim_loop()
+        self._cancel_ping_probe()
+        self.traffic_btn.config(text="Run Traffic (Ctrl+T)")
+        self.ping_status.config(text="Ping: idle", fg="#9e9e9e")
         self.canvas.delete("all")
         self.nodes.clear()
         self.edges.clear()
@@ -1311,6 +1669,9 @@ class TopologyTool:
                 pass
         self.cli_windows.clear()
         self.sim.reset()
+
+        # Clear visual stress engine state
+        self.visual_engine.clear_all()
 
         self.node_uid.clear()
         self.uid_node.clear()
@@ -1468,10 +1829,15 @@ class TopologyTool:
         # Track left button state (for ping mode).
         self._buttons_down.add("L")
 
-        # If we're already in ping mode, the next device click is the destination.
+        node = self.get_node_at(event.x, event.y)
+
+        # If we're already in ping mode, clicking a selected node or empty space cancels it; otherwise run ping.
         if getattr(self, "ping_mode", False):
-            node = self.get_node_at(event.x, event.y)
-            if node is not None:
+            if node is None:
+                self._cancel_ping_mode()
+            elif node in self.selected_nodes:
+                self._cancel_ping_mode()
+            else:
                 self._run_ping_mode(node)
                 return
 
@@ -1486,7 +1852,6 @@ class TopologyTool:
         self.pre_press_chain = self.chain_node
         self.chain_set_on_press = False
 
-        node = self.get_node_at(event.x, event.y)
         # If right is currently held and user presses left on a node, enter ping mode.
         if node is not None and "R" in self._buttons_down:
             self._start_ping_mode(node)
@@ -1743,19 +2108,28 @@ class TopologyTool:
         )
         self.node_labels[node_canvas_id] = lbl
 
-    def _create_node_of_type(self, node_type: str, x: float, y: float, forced_uid: Optional[str] = None):
+    def _selected_profile_for(self, node_type: str) -> str:
+        node_type = (node_type or "").lower()
+        if node_type == "router":
+            return self.router_profile_var.get() or "MODERN_ROUTER"
+        if node_type == "switch":
+            return self.switch_profile_var.get() or "MODERN_ACCESS_SWITCH"
+        return "HOST_OPTIMIZED"
+
+    def _create_node_of_type(self, node_type: str, x: float, y: float, forced_uid: Optional[str] = None, hardware_profile: Optional[str] = None):
         node_type = (node_type or "").lower()
         if node_type not in ("router", "switch", "host"):
             node_type = "router"
 
         if node_type == "router":
+            hw = hardware_profile or self._selected_profile_for("router")
             node = self.canvas.create_oval(
                 x - NODE_RADIUS, y - NODE_RADIUS,
                 x + NODE_RADIUS, y + NODE_RADIUS,
                 fill="#4fc3f7", outline="", width=0,
                 tags=("topo",)
             )
-            self.nodes[node] = {"type": "router", "seq": self.node_seq}
+            self.nodes[node] = {"type": "router", "seq": self.node_seq, "hardware_profile": hw}
             self.node_seq += 1
             self._attach_uid_and_label(node, "router", forced_uid)
             self._sim_on_node_created(node)
@@ -1768,13 +2142,14 @@ class TopologyTool:
             return node
 
         if node_type == "switch":
+            hw = hardware_profile or self._selected_profile_for("switch")
             node = self.canvas.create_rectangle(
                 x - NODE_RADIUS, y - NODE_RADIUS,
                 x + NODE_RADIUS, y + NODE_RADIUS,
                 fill="#81c784", outline="", width=0,
                 tags=("topo",)
             )
-            self.nodes[node] = {"type": "switch", "seq": self.node_seq}
+            self.nodes[node] = {"type": "switch", "seq": self.node_seq, "hardware_profile": hw}
             self.node_seq += 1
             self._attach_uid_and_label(node, "switch", forced_uid)
             self._sim_on_node_created(node)
@@ -1786,13 +2161,14 @@ class TopologyTool:
                 pass
             return node
 
+        hw = hardware_profile or "HOST_OPTIMIZED"
         node = self.canvas.create_rectangle(
             x - NODE_RADIUS, y - NODE_RADIUS,
             x + NODE_RADIUS, y + NODE_RADIUS,
             fill="#ffb74d", outline="", width=0,
             tags=("topo",)
         )
-        self.nodes[node] = {"type": "host", "seq": self.node_seq}
+        self.nodes[node] = {"type": "host", "seq": self.node_seq, "hardware_profile": hw}
         self.node_seq += 1
         self._attach_uid_and_label(node, "host", forced_uid)
         self._sim_on_node_created(node)
@@ -1809,7 +2185,8 @@ class TopologyTool:
         meta = self.nodes.get(node_canvas_id, {})
         if not uid:
             return
-        self.sim.add_device(uid, meta.get("type", "router"))
+        hw = meta.get("hardware_profile") or self._selected_profile_for(meta.get("type", "router"))
+        self.sim.add_device(uid, meta.get("type", "router"), hardware_profile=hw)
 
     def create_node(self, x, y):
         if self.mode == "router":
@@ -2212,10 +2589,11 @@ class TopologyTool:
 
 
 class DeviceCLIWindow:
-    def __init__(self, root: tk.Tk, uid: str, cli_engine, banner: Optional[str] = None):
+    def __init__(self, root: tk.Tk, uid: str, cli_engine, banner: Optional[str] = None, log_cb=None):
         self.root = root
         self.uid = uid
         self.cli_engine = cli_engine
+        self._log_cb = log_cb
         self.ctx = cli_engine.new_context(uid)
 
         self.history: List[str] = []
@@ -2271,6 +2649,14 @@ class DeviceCLIWindow:
         self._write_line(banner or f"{uid} IOS-like CLI (lightweight)")
         self._write_line("")
 
+    def _log(self, kind: str, **data):
+        if not self._log_cb:
+            return
+        try:
+            self._log_cb(kind, **data)
+        except Exception:
+            pass
+
     def alive(self) -> bool:
         try:
             return bool(self.win.winfo_exists())
@@ -2313,12 +2699,23 @@ class DeviceCLIWindow:
             self.history.append(line)
             self.hist_idx = len(self.history)
 
+        if line.strip():
+            self._log(
+                "cli_command",
+                uid=self.uid,
+                command=line,
+                mode=getattr(self.ctx, "mode", None),
+                privileged=getattr(self.ctx, "privileged", None),
+            )
+
         res = self.cli_engine.execute(self.ctx, line)
         if res.output == "__CLOSE__":
+            self._log("cli_output", uid=self.uid, command=line, output=res.output)
             self.close()
             return "break"
         if res.output:
             self._write(res.output + "\n")
+            self._log("cli_output", uid=self.uid, command=line, output=res.output)
         self._set_prompt()
         return "break"
 

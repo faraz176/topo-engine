@@ -117,7 +117,7 @@ Your job:
 
 Constraints for topology JSON:
 - node.id must be unique (use R# for routers, SW# for switches, PC# for hosts)
-- node.type must be "router", "switch", or "host"
+- node.type must be "router", switch", or "host"
 - x,y should be within a ~1200x800 canvas (roughly 0..1200, 0..800)
 - links use ids that exist in nodes
 - avoid duplicate links (a-b same as b-a)
@@ -131,6 +131,18 @@ CRITICAL (make labs actually work in the simulator):
 - For router-on-a-stick, you must bring UP the parent physical interface (e.g., `interface Gi0/0` -> `no shutdown`) AND each subinterface (e.g., `interface Gi0/0.10` -> `no shutdown`).
 - If you configure a trunk, include `switchport mode trunk` and (when VLANs are specified) `switchport trunk allowed vlan ...`.
 - For switch ports used for forwarding (access or trunk), explicitly add `no shutdown` in each interface stanza so they come up.
+
+CRITICAL (proper subnet design for working connectivity):
+- Each router interface MUST be on a UNIQUE subnet. Never assign multiple router interfaces to the same subnet (e.g., 192.168.1.0/24).
+- When connecting MULTIPLE hosts to a router, use a SWITCH between them:
+  * Router Gi0/0 (192.168.1.1/24) -> Switch -> PC1 (192.168.1.10), PC2 (192.168.1.11), etc.
+  * All hosts on the same switch share one subnet and one gateway IP.
+- If you MUST connect hosts directly to different router interfaces (no switch):
+  * Each host gets its OWN subnet on its dedicated router interface.
+  * Example: R1 Gi0/0=192.168.1.1/24 -> PC1=192.168.1.10 gw 192.168.1.1
+             R1 Gi0/1=192.168.2.1/24 -> PC2=192.168.2.10 gw 192.168.2.1
+  * Add static routes on both routers to reach all remote subnets.
+- Host gateway MUST be the IP of the router interface directly connected to that host (or to the switch the host is on).
 
 If your configs reference specific interface names, also provide explicit link.ifaces so the UI creates those interfaces deterministically.
 

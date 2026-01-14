@@ -1,0 +1,175 @@
+{
+  "schemaVersion": 2,
+  "meta": {
+    "name": "Topology"
+  },
+  "nodes": [
+    {
+      "id": "R1",
+      "type": "router",
+      "x": 362.1147122232999,
+      "y": 193.78772335109994,
+      "seq": 0
+    },
+    {
+      "id": "R2",
+      "type": "router",
+      "x": 616.7599817833001,
+      "y": 193.78772335109994,
+      "seq": 1
+    },
+    {
+      "id": "R3",
+      "type": "router",
+      "x": 871.4052513433,
+      "y": 193.78772335109994,
+      "seq": 2
+    }
+  ],
+  "links": [
+    {
+      "a": "R1",
+      "b": "R2",
+      "type": "ethernet",
+      "ifaces": [
+        {
+          "a_if": "Gi0/0",
+          "b_if": "Gi0/1"
+        }
+      ]
+    },
+    {
+      "a": "R2",
+      "b": "R3",
+      "type": "ethernet",
+      "ifaces": [
+        {
+          "a_if": "Gi0/2",
+          "b_if": "Gi0/3"
+        }
+      ]
+    }
+  ],
+  "deviceConfigs": {
+    "R1": {
+      "kind": "router",
+      "host": {
+        "gateway": null,
+        "dns": null
+      },
+      "interfaces": {
+        "Gi0/0": {
+          "admin_up": false,
+          "mac": "02:bd:2c:7f:14:8a",
+          "ip": null,
+          "mask": null,
+          "mode": "routed",
+          "access_vlan": 1,
+          "trunk_vlans": [
+            1
+          ],
+          "channel_group": null,
+          "channel_mode": null,
+          "acl_in": null,
+          "acl_out": null
+        }
+      },
+      "vlans": {
+        "1": "default"
+      },
+      "static_routes": [],
+      "ospf": {
+        "enabled": false,
+        "process_id": "1",
+        "router_id": null,
+        "networks": []
+      },
+      "acls": {}
+    },
+    "R2": {
+      "kind": "router",
+      "host": {
+        "gateway": null,
+        "dns": null
+      },
+      "interfaces": {
+        "Gi0/1": {
+          "admin_up": false,
+          "mac": "02:71:df:1a:ee:77",
+          "ip": null,
+          "mask": null,
+          "mode": "routed",
+          "access_vlan": 1,
+          "trunk_vlans": [
+            1
+          ],
+          "channel_group": null,
+          "channel_mode": null,
+          "acl_in": null,
+          "acl_out": null
+        },
+        "Gi0/2": {
+          "admin_up": false,
+          "mac": "02:71:df:1a:ef:77",
+          "ip": null,
+          "mask": null,
+          "mode": "routed",
+          "access_vlan": 1,
+          "trunk_vlans": [
+            1
+          ],
+          "channel_group": null,
+          "channel_mode": null,
+          "acl_in": null,
+          "acl_out": null
+        }
+      },
+      "vlans": {
+        "1": "default"
+      },
+      "static_routes": [],
+      "ospf": {
+        "enabled": false,
+        "process_id": "1",
+        "router_id": null,
+        "networks": []
+      },
+      "acls": {}
+    },
+    "R3": {
+      "kind": "router",
+      "host": {
+        "gateway": null,
+        "dns": null
+      },
+      "interfaces": {
+        "Gi0/3": {
+          "admin_up": false,
+          "mac": "02:26:91:b6:c9:64",
+          "ip": null,
+          "mask": null,
+          "mode": "routed",
+          "access_vlan": 1,
+          "trunk_vlans": [
+            1
+          ],
+          "channel_group": null,
+          "channel_mode": null,
+          "acl_in": null,
+          "acl_out": null
+        }
+      },
+      "vlans": {
+        "1": "default"
+      },
+      "static_routes": [],
+      "ospf": {
+        "enabled": false,
+        "process_id": "1",
+        "router_id": null,
+        "networks": []
+      },
+      "acls": {}
+    }
+  }
+}
